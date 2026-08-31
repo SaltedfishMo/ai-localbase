@@ -7,10 +7,11 @@ on:
       - develop
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  GITHUB_OWNER: veyliss
+  IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
   quality-backend:
@@ -71,6 +72,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -85,7 +89,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.GITHUB_OWNER }}/ai-localbase-backend
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ai-localbase-backend
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -96,7 +100,7 @@ jobs:
 
       - name: Validate Backend Docker tags
         run: |
-          printf '%s\n' "$DOCKER_METADATA_TAGS" | scripts/check-docker-metadata-tags.sh "${REGISTRY}/${GITHUB_OWNER}/ai-localbase-backend" "${GITHUB_REF_NAME}" "${GITHUB_REF_TYPE}"
+          printf '%s\n' "$DOCKER_METADATA_TAGS" | scripts/check-docker-metadata-tags.sh "${REGISTRY}/${IMAGE_OWNER}/ai-localbase-backend" "${GITHUB_REF_NAME}" "${GITHUB_REF_TYPE}"
         env:
           DOCKER_METADATA_TAGS: ${{ steps.meta.outputs.tags }}
 
@@ -105,6 +109,7 @@ jobs:
         with:
           context: ./backend
           file: ./docker/backend.Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             APP_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
@@ -124,6 +129,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -138,7 +146,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.GITHUB_OWNER }}/ai-localbase-frontend
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ai-localbase-frontend
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -149,7 +157,7 @@ jobs:
 
       - name: Validate Frontend Docker tags
         run: |
-          printf '%s\n' "$DOCKER_METADATA_TAGS" | scripts/check-docker-metadata-tags.sh "${REGISTRY}/${GITHUB_OWNER}/ai-localbase-frontend" "${GITHUB_REF_NAME}" "${GITHUB_REF_TYPE}"
+          printf '%s\n' "$DOCKER_METADATA_TAGS" | scripts/check-docker-metadata-tags.sh "${REGISTRY}/${IMAGE_OWNER}/ai-localbase-frontend" "${GITHUB_REF_NAME}" "${GITHUB_REF_TYPE}"
         env:
           DOCKER_METADATA_TAGS: ${{ steps.meta.outputs.tags }}
 
@@ -158,6 +166,7 @@ jobs:
         with:
           context: .
           file: ./docker/frontend.Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             VITE_APP_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
@@ -190,8 +199,8 @@ jobs:
 
           ## Docker Images
 
-          - Backend: `ghcr.io/veyliss/ai-localbase-backend:${{ github.ref_name }}`
-          - Frontend: `ghcr.io/veyliss/ai-localbase-frontend:${{ github.ref_name }}`
+          - Backend: `ghcr.io/${{ github.repository_owner }}/ai-localbase-backend:${{ github.ref_name }}`
+          - Frontend: `ghcr.io/${{ github.repository_owner }}/ai-localbase-frontend:${{ github.ref_name }}`
 
           ## Quick Start
 
