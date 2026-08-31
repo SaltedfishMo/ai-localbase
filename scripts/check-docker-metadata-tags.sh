@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-image="${1:-}"
+raw_image="${1:-}"
+image="$(printf '%s' "$raw_image" | tr '[:upper:]' '[:lower:]')"
 ref_name="${2:-${GITHUB_REF_NAME:-}}"
 ref_type="${3:-${GITHUB_REF_TYPE:-}}"
 
