@@ -46,6 +46,7 @@ type AppServiceReader interface {
 type contextAwareAppService interface {
 	BuildRetrievalContextWithContext(ctx context.Context, req model.ChatCompletionRequest) (string, []map[string]string, error)
 	DebugRetrieveWithContext(ctx context.Context, req model.RetrievalDebugRequest) (model.RetrievalDebugResponse, error)
+	GetKnowledgeBaseHealthWithContext(ctx context.Context, knowledgeBaseID string) (model.KnowledgeBaseHealthResponse, error)
 	StageInlineUploadAs(fileName string, content []byte, source string, owner service.AuthPrincipal) (model.StagedUpload, error)
 	RegisterStagedUploadAs(ctx context.Context, uploadID, knowledgeBaseID, fileName string, owner service.AuthPrincipal) (model.Document, error)
 	StartMCPImportJobAs(req model.MCPStartImportJobRequest, owner service.AuthPrincipal) (model.MCPJob, error)
@@ -53,6 +54,14 @@ type contextAwareAppService interface {
 	CancelMCPJobAs(jobID string, owner service.AuthPrincipal) (model.MCPJob, error)
 	ListRecentMCPJobsAs(limit int, owner service.AuthPrincipal) []model.MCPJob
 	ReindexDocumentWithContext(ctx context.Context, knowledgeBaseID, documentID string) (model.Document, error)
+}
+
+type mcpJobRetryService interface {
+	RetryMCPJobAs(jobID string, owner service.AuthPrincipal) (model.MCPJob, error)
+}
+
+type mcpJobListPageService interface {
+	ListMCPJobsPageAs(limit int, cursor string, owner service.AuthPrincipal) (service.MCPJobPage, error)
 }
 
 func contextAwareService(appService AppServiceReader) (contextAwareAppService, bool) {
@@ -114,6 +123,20 @@ func listRecentMCPJobsAs(appService AppServiceReader, limit int, owner service.A
 		return enhanced.ListRecentMCPJobsAs(limit, owner)
 	}
 	return appService.ListRecentMCPJobs(limit)
+}
+
+func listMCPJobsPageAs(appService AppServiceReader, limit int, cursor string, owner service.AuthPrincipal) (service.MCPJobPage, error) {
+	if enhanced, ok := appService.(mcpJobListPageService); ok {
+		return enhanced.ListMCPJobsPageAs(limit, cursor, owner)
+	}
+	return service.MCPJobPage{Items: listRecentMCPJobsAs(appService, limit, owner)}, nil
+}
+
+func retryMCPJobAs(appService AppServiceReader, jobID string, owner service.AuthPrincipal) (model.MCPJob, error) {
+	if enhanced, ok := appService.(mcpJobRetryService); ok {
+		return enhanced.RetryMCPJobAs(jobID, owner)
+	}
+	return model.MCPJob{}, fmt.Errorf("mcp job retry is unavailable")
 }
 
 func reindexDocumentWithContext(appService AppServiceReader, ctx context.Context, knowledgeBaseID, documentID string) (model.Document, error) {
@@ -270,7 +293,9 @@ func buildKnowledgeBaseQualityInsights(health model.KnowledgeBaseHealthResponse,
 	if health.Metrics.EmptyContentCount > 0 {
 		insights = append(insights, fmt.Sprintf("存在 %d 个原文不可用文档，可能影响摘要、引用和重建索引。", health.Metrics.EmptyContentCount))
 	}
-	if health.Metrics.VectorCount == 0 && health.Metrics.DocumentCount > 0 {
+	if health.Metrics.VectorCountSource == "unknown" {
+		insights = append(insights, "当前无法确认 Qdrant 的实际向量数量，不能将未知状态视为零向量；建议检查 Qdrant 连接、鉴权和 collection。")
+	} else if health.Metrics.VectorCountSource == "actual" && health.Metrics.VectorCount == 0 && health.Metrics.IndexedCount > 0 {
 		insights = append(insights, "当前没有向量索引，RAG 检索质量会明显受限。")
 	}
 	if len(health.Recommendations) > 0 {
@@ -498,6 +523,11 @@ func truncateText(value string, limit int) string {
 }
 
 func buildMCPCapabilities(cfg model.AppConfig, tools []ToolDefinition) map[string]any {
+	return buildMCPCapabilitiesForVersion(cfg, tools, resultContractVersion)
+}
+
+func buildMCPCapabilitiesForVersion(cfg model.AppConfig, tools []ToolDefinition, contractVersion string) map[string]any {
+	contractVersion = normalizeMCPResultContractVersion(contractVersion)
 	permissionCounts := map[string]int{
 		string(ToolPermissionReadOnly): 0,
 		string(ToolPermissionWrite):    0,
@@ -512,7 +542,9 @@ func buildMCPCapabilities(cfg model.AppConfig, tools []ToolDefinition) map[strin
 			"readOnly":              tool.ReadOnly,
 			"permissionLevel":       permission,
 			"requiredScopes":        requiredScopesForTool(tool),
-			"resultContractVersion": resultContractVersion,
+			"contractVersions":      supportedMCPResultContractVersions(),
+			"resultContractVersion": contractVersion,
+			"retryPolicy":           mcpToolRetryPolicy(tool),
 		}
 		if tool.Name == "start_import_job" {
 			toolItem["scopeVariants"] = map[string][]string{
@@ -526,16 +558,17 @@ func buildMCPCapabilities(cfg model.AppConfig, tools []ToolDefinition) map[strin
 	}
 
 	return map[string]any{
-		"name":             serverName,
-		"version":          serverVersion,
-		"protocolVersion":  protocolVersion,
-		"jsonrpc":          jsonRPCVersion,
-		"transport":        "http",
-		"enabled":          cfg.MCP.Enabled,
-		"basePath":         cfg.MCP.BasePath,
-		"toolCount":        len(tools),
-		"permissionCounts": permissionCounts,
-		"tools":            toolItems,
+		"name":                serverName,
+		"version":             serverVersion,
+		"protocolVersion":     protocolVersion,
+		"contractNegotiation": mcpContractNegotiationPayload(contractVersion, ""),
+		"jsonrpc":             jsonRPCVersion,
+		"transport":           "http",
+		"enabled":             cfg.MCP.Enabled,
+		"basePath":            cfg.MCP.BasePath,
+		"toolCount":           len(tools),
+		"permissionCounts":    permissionCounts,
+		"tools":               toolItems,
 		"capabilities": map[string]any{
 			"tools":   map[string]any{"listChanged": false},
 			"metrics": map[string]any{"path": "/metrics", "scope": scopeMCPRead},
@@ -554,14 +587,16 @@ func buildMCPCapabilities(cfg model.AppConfig, tools []ToolDefinition) map[strin
 			"endpoint":     "/api/config/mcp/danger-confirmations",
 			"legacyHeader": "X-MCP-Confirm",
 		},
-		"jobSupport":            true,
-		"resultContractVersion": resultContractVersion,
-		"errorCodes":            mcpErrorCatalog(),
+		"jobSupport":                      true,
+		"resultContractVersion":           contractVersion,
+		"supportedResultContractVersions": supportedMCPResultContractVersions(),
+		"errorCodes":                      mcpErrorCatalog(),
 		"auth": map[string]any{
 			"type":                  "api_key_scope",
 			"legacyTokenCompatible": cfg.MCP.LegacyTokenEnabled,
 			"legacyTokenConfigured": strings.TrimSpace(cfg.MCP.Token) != "",
-			"legacyTokenPermission": "mcp:admin-compatible",
+			"legacyTokenPermission": "mcp:read-compatible",
+			"legacyTokenScopes":     []string{scopeMCPRead},
 			"adminScope":            scopeMCPAdmin,
 		},
 		"dangerousToolGate": map[string]any{
@@ -629,6 +664,9 @@ func buildSafeMCPDocumentDiagnostics(diagnostics model.DocumentIndexDiagnostics)
 		"rawContentChars":       diagnostics.RawContentChars,
 		"chunkCount":            diagnostics.ChunkCount,
 		"vectorCount":           diagnostics.VectorCount,
+		"vectorCountStatus":     diagnostics.VectorCountStatus,
+		"vectorCountSource":     diagnostics.VectorCountSource,
+		"vectorCountErrorCode":  diagnostics.VectorCountErrorCode,
 		"summaryChunkCount":     diagnostics.SummaryChunkCount,
 		"structuredRowCount":    diagnostics.StructuredRowCount,
 		"rawContentAvailable":   diagnostics.RawContentAvailable,
@@ -642,20 +680,23 @@ func buildSafeMCPKnowledgeBaseHealth(health model.KnowledgeBaseHealthResponse) m
 	documents := make([]map[string]any, 0, len(health.Documents))
 	for _, document := range health.Documents {
 		documents = append(documents, map[string]any{
-			"documentId":          document.DocumentID,
-			"documentName":        document.DocumentName,
-			"status":              document.Status,
-			"indexedAt":           document.IndexedAt,
-			"errorCode":           document.IndexErrorCode,
-			"indexVersion":        document.IndexVersion,
-			"chunkCount":          document.ChunkCount,
-			"vectorCount":         document.VectorCount,
-			"summaryChunkCount":   document.SummaryChunkCount,
-			"structuredRowCount":  document.StructuredRowCount,
-			"rawContentChars":     document.RawContentChars,
-			"rawContentAvailable": document.RawContentAvailable,
-			"needsReindex":        document.NeedsReindex,
-			"recommendation":      document.Recommendation,
+			"documentId":           document.DocumentID,
+			"documentName":         document.DocumentName,
+			"status":               document.Status,
+			"indexedAt":            document.IndexedAt,
+			"errorCode":            document.IndexErrorCode,
+			"indexVersion":         document.IndexVersion,
+			"chunkCount":           document.ChunkCount,
+			"vectorCount":          document.VectorCount,
+			"vectorCountStatus":    document.VectorCountStatus,
+			"vectorCountSource":    document.VectorCountSource,
+			"vectorCountErrorCode": document.VectorCountErrorCode,
+			"summaryChunkCount":    document.SummaryChunkCount,
+			"structuredRowCount":   document.StructuredRowCount,
+			"rawContentChars":      document.RawContentChars,
+			"rawContentAvailable":  document.RawContentAvailable,
+			"needsReindex":         document.NeedsReindex,
+			"recommendation":       document.Recommendation,
 		})
 	}
 
@@ -666,18 +707,29 @@ func buildSafeMCPKnowledgeBaseHealth(health model.KnowledgeBaseHealthResponse) m
 		"score":               health.Score,
 		"currentIndexVersion": health.CurrentIndexVersion,
 		"metrics": map[string]any{
-			"documentCount":      health.Metrics.DocumentCount,
-			"indexedCount":       health.Metrics.IndexedCount,
-			"processingCount":    health.Metrics.ProcessingCount,
-			"failedCount":        health.Metrics.FailedCount,
-			"emptyContentCount":  health.Metrics.EmptyContentCount,
-			"chunkCount":         health.Metrics.ChunkCount,
-			"vectorCount":        health.Metrics.VectorCount,
-			"summaryChunkCount":  health.Metrics.SummaryChunkCount,
-			"structuredRowCount": health.Metrics.StructuredRowCount,
-			"rawContentChars":    health.Metrics.RawContentChars,
-			"qdrantEnabled":      health.Metrics.QdrantEnabled,
-			"lastIndexedAt":      health.Metrics.LastIndexedAt,
+			"documentCount":          health.Metrics.DocumentCount,
+			"indexedCount":           health.Metrics.IndexedCount,
+			"processingCount":        health.Metrics.ProcessingCount,
+			"failedCount":            health.Metrics.FailedCount,
+			"emptyContentCount":      health.Metrics.EmptyContentCount,
+			"chunkCount":             health.Metrics.ChunkCount,
+			"vectorCount":            health.Metrics.VectorCount,
+			"vectorCountStatus":      health.Metrics.VectorCountStatus,
+			"vectorCountSource":      health.Metrics.VectorCountSource,
+			"vectorCountErrorCode":   health.Metrics.VectorCountErrorCode,
+			"summaryChunkCount":      health.Metrics.SummaryChunkCount,
+			"structuredRowCount":     health.Metrics.StructuredRowCount,
+			"rawContentChars":        health.Metrics.RawContentChars,
+			"qdrantEnabled":          health.Metrics.QdrantEnabled,
+			"qdrantStatus":           health.Metrics.QdrantStatus,
+			"qdrantCollectionStatus": health.Metrics.QdrantCollectionStatus,
+			"qdrantCollectionExists": health.Metrics.QdrantCollectionExists,
+			"qdrantPointCount":       health.Metrics.QdrantPointCount,
+			"qdrantPointCountKnown":  health.Metrics.QdrantPointCountKnown,
+			"expectedVectorSize":     health.Metrics.ExpectedVectorSize,
+			"qdrantVectorSize":       health.Metrics.QdrantVectorSize,
+			"qdrantSparseEnabled":    health.Metrics.QdrantSparseEnabled,
+			"lastIndexedAt":          health.Metrics.LastIndexedAt,
 		},
 		"recommendations": health.Recommendations,
 		"documents":       documents,
@@ -754,7 +806,11 @@ func modelNowRFC3339() string {
 }
 
 func validateUploadFileName(fileName string, cfg model.AppConfig) error {
-	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(fileName)))
+	normalizedName, err := util.NormalizeFilename(fileName)
+	if err != nil {
+		return err
+	}
+	ext := strings.ToLower(filepath.Ext(normalizedName))
 	allowed := map[string]struct{}{
 		".txt": {},
 		".md":  {},
@@ -776,7 +832,11 @@ func validateUploadFileName(fileName string, cfg model.AppConfig) error {
 }
 
 func validateTextUploadFileName(fileName string, cfg model.AppConfig) error {
-	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(fileName)))
+	normalizedName, err := util.NormalizeFilename(fileName)
+	if err != nil {
+		return err
+	}
+	ext := strings.ToLower(filepath.Ext(normalizedName))
 	allowed := map[string]struct{}{
 		".txt": {},
 		".md":  {},

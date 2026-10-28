@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -93,8 +95,8 @@ func TestReadinessReturnsReadyWithoutOptionalDependencies(t *testing.T) {
 	if response.Status != "ready" {
 		t.Fatalf("expected ready status, got %#v", response)
 	}
-	if response.Checks["chat_model"].Status != "configured" {
-		t.Fatalf("expected default chat model configuration to be reported, got %#v", response.Checks["chat_model"])
+	if strings.Contains(recorder.Body.String(), "checks") {
+		t.Fatalf("readiness response must not expose component diagnostics: %s", recorder.Body.String())
 	}
 }
 
@@ -117,5 +119,76 @@ func TestReadinessReturnsUnavailableWhenQdrantIsDown(t *testing.T) {
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected readiness status 503, got %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestReadinessReturnsUnavailableWhenStagingManifestIsCorrupt(t *testing.T) {
+	stagingDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), []byte("not-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt staging manifest: %v", err)
+	}
+	appService := service.NewAppService(nil, nil, nil, model.ServerConfig{StagingDir: stagingDir})
+	handler := NewConfigHandler(appService, nil)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	handler.Readiness(context)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected readiness status 503, got %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), stagingDir) || strings.Contains(recorder.Body.String(), "checks") {
+		t.Fatalf("readiness response must not expose diagnostics: %s", recorder.Body.String())
+	}
+}
+
+func TestReadinessRequiresMCPJobStoreWhenMCPIsEnabled(t *testing.T) {
+	serverConfig := model.ServerConfig{EnableMCP: true}
+	appService := service.NewAppService(nil, nil, nil, serverConfig)
+	handler := NewConfigHandler(appService, nil)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	handler.Readiness(context)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected readiness status 503 without MCP job store, got %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHealthAndLivenessExposeOnlyProbeStatus(t *testing.T) {
+	appService := service.NewAppService(nil, nil, nil, model.ServerConfig{EnableAuth: true})
+	appHandler := NewAppHandler(model.ServerConfig{EnableAuth: true}, appService, nil)
+
+	for _, test := range []struct {
+		name   string
+		handle gin.HandlerFunc
+		status string
+	}{
+		{name: "health", handle: appHandler.Health, status: "ok"},
+		{name: "liveness", handle: appHandler.Liveness, status: "alive"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Request = httptest.NewRequest(http.MethodGet, "/"+test.name, nil)
+			test.handle(context)
+
+			var response map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode probe response: %v", err)
+			}
+			if response["status"] != test.status || len(response) != 1 {
+				t.Fatalf("expected minimal probe response, got %#v", response)
+			}
+			if strings.Contains(recorder.Body.String(), "auth_enabled") || strings.Contains(recorder.Body.String(), "knowledge_bases") {
+				t.Fatalf("probe response must not expose health configuration: %s", recorder.Body.String())
+			}
+		})
 	}
 }

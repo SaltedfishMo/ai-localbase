@@ -83,6 +83,16 @@ type structuredRowMatch struct {
 }
 
 func (s *AppService) QueryStructuredData(req model.ChatCompletionRequest) (StructuredDataQueryResult, []map[string]string, bool, error) {
+	if err := s.validateKnowledgeScope(req.KnowledgeBaseID, req.DocumentID); err != nil {
+		return StructuredDataQueryResult{}, nil, false, err
+	}
+	knowledgeScope, err := ResolveKnowledgeScope(req.KnowledgeScope, req.KnowledgeBaseID, req.DocumentID)
+	if err != nil {
+		return StructuredDataQueryResult{}, nil, false, err
+	}
+	if knowledgeScope == KnowledgeScopeNone {
+		return StructuredDataQueryResult{}, nil, false, nil
+	}
 	query := latestUserMessage(req.Messages)
 	if !looksLikeStructuredDataQuery(query) {
 		return StructuredDataQueryResult{}, nil, false, nil
@@ -158,14 +168,30 @@ func (s *AppService) resolveStructuredTableDocuments(req model.ChatCompletionReq
 	if s == nil || s.state == nil {
 		return nil
 	}
+	knowledgeScope, err := ResolveKnowledgeScope(req.KnowledgeScope, req.KnowledgeBaseID, req.DocumentID)
+	if err != nil || knowledgeScope == KnowledgeScopeNone {
+		return nil
+	}
 
 	s.state.Mu.RLock()
 	defer s.state.Mu.RUnlock()
 
 	if documentID := strings.TrimSpace(req.DocumentID); documentID != "" {
+		if knowledgeBaseID := strings.TrimSpace(req.KnowledgeBaseID); knowledgeBaseID != "" {
+			kb, ok := s.state.KnowledgeBases[knowledgeBaseID]
+			if !ok {
+				return nil
+			}
+			for _, document := range kb.Documents {
+				if document.ID == documentID && isStructuredDocument(document) && isRetrievableDocument(document) {
+					return []model.Document{document}
+				}
+			}
+			return nil
+		}
 		for _, kb := range s.state.KnowledgeBases {
 			for _, document := range kb.Documents {
-				if document.ID == documentID && isStructuredDocument(document) {
+				if document.ID == documentID && isStructuredDocument(document) && isRetrievableDocument(document) {
 					return []model.Document{document}
 				}
 			}
@@ -181,6 +207,10 @@ func (s *AppService) resolveStructuredTableDocuments(req model.ChatCompletionReq
 		return structuredDocumentsFromKnowledgeBase(kb)
 	}
 
+	if knowledgeScope != KnowledgeScopeAll {
+		return nil
+	}
+
 	var documents []model.Document
 	for _, kb := range s.state.KnowledgeBases {
 		documents = append(documents, structuredDocumentsFromKnowledgeBase(kb)...)
@@ -194,7 +224,7 @@ func (s *AppService) resolveStructuredTableDocuments(req model.ChatCompletionReq
 func structuredDocumentsFromKnowledgeBase(kb model.KnowledgeBase) []model.Document {
 	documents := make([]model.Document, 0)
 	for _, document := range kb.Documents {
-		if isStructuredDocument(document) {
+		if isStructuredDocument(document) && isRetrievableDocument(document) {
 			documents = append(documents, document)
 		}
 	}

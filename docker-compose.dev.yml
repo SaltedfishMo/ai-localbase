@@ -29,7 +29,7 @@ services:
     volumes:
       - ${QDRANT_STORAGE_PATH:-./qdrant_storage}:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333; printf \"GET /collections HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; head -n 1 <&3 | grep -q \" 200 \"'"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333; if [ -n \"$$AI_LOCALBASE_QDRANT_API_KEY\" ]; then printf \"GET /collections HTTP/1.1\\r\\nHost: localhost\\r\\napi-key: %s\\r\\nConnection: close\\r\\n\\r\\n\" \"$$AI_LOCALBASE_QDRANT_API_KEY\" >&3; else printf \"GET /collections HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; fi; head -n 1 <&3 | grep -q \" 200 \"'"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -55,6 +55,7 @@ services:
       MAX_JSON_BODY_BYTES: ${MAX_JSON_BODY_BYTES:-4194304}
       STATE_FILE: ${STATE_FILE:-/app/data/app-state.json}
       CHAT_HISTORY_FILE: ${CHAT_HISTORY_FILE:-/app/data/chat-history.db}
+      MCP_JOB_STORE_FILE: ${MCP_JOB_STORE_FILE:-/app/data/mcp-jobs.db}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION_PREFIX: ${QDRANT_COLLECTION_PREFIX:-kb_}
@@ -86,6 +87,13 @@ services:
       MCP_BASE_PATH: ${MCP_BASE_PATH:-/mcp}
       MCP_REQUEST_TIMEOUT_SECONDS: ${MCP_REQUEST_TIMEOUT_SECONDS:-15}
       MCP_REQUESTS_PER_MINUTE: ${MCP_REQUESTS_PER_MINUTE:-120}
+      API_REQUESTS_PER_MINUTE: ${API_REQUESTS_PER_MINUTE:-120}
+      API_MAX_CONCURRENT_REQUESTS: ${API_MAX_CONCURRENT_REQUESTS:-16}
+      CHAT_MAX_CONCURRENT_REQUESTS: ${CHAT_MAX_CONCURRENT_REQUESTS:-4}
+      INDEX_MAX_CONCURRENT_REQUESTS: ${INDEX_MAX_CONCURRENT_REQUESTS:-2}
+      EVAL_MAX_CONCURRENT_REQUESTS: ${EVAL_MAX_CONCURRENT_REQUESTS:-1}
+      UPLOAD_MAX_CONCURRENT_REQUESTS: ${UPLOAD_MAX_CONCURRENT_REQUESTS:-4}
+      MODEL_TEST_MAX_CONCURRENT_REQUESTS: ${MODEL_TEST_MAX_CONCURRENT_REQUESTS:-2}
       GO111MODULE: "on"
     command: sh -c "go run ."
     ports:
@@ -99,7 +107,7 @@ services:
       retries: 12
 
   frontend:
-    image: node:20.19-alpine
+    image: node:20.19.5-alpine3.22
     container_name: ai-localbase-frontend-dev
     restart: unless-stopped
     working_dir: /app
@@ -107,7 +115,6 @@ services:
       backend:
         condition: service_healthy
     environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
       VITE_DEV_PROXY_TARGET: ${VITE_DEV_PROXY_TARGET:-http://backend:8080}
       VITE_APP_VERSION: ${VITE_APP_VERSION:-}
       CHOKIDAR_USEPOLLING: "true"

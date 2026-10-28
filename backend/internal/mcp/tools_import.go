@@ -260,11 +260,35 @@ func newImportTools(appService AppServiceReader) []ToolDefinition {
 			},
 		},
 		{
+			Name:            "retry_job",
+			Description:     "显式重试已失败的 MCP 长任务。只允许重试失败状态，最多重试 3 次；参数 jobId 为必填。",
+			InputSchema:     requiredStringPropertySchema("jobId", "Job ID"),
+			ReadOnly:        false,
+			PermissionLevel: ToolPermissionWrite,
+			Handler: func(ctx context.Context, args map[string]any) (ToolCallResult, error) {
+				caller := principalFromContext(ctx)
+				jobID, err := requiredStringArg(args, "jobId")
+				if err != nil {
+					return ToolCallResult{}, err
+				}
+				job, err := retryMCPJobAs(appService, jobID, caller)
+				if err != nil {
+					return ToolCallResult{}, err
+				}
+				job = sanitizeMCPJob(job)
+				return NewTextResult(
+					fmt.Sprintf("失败任务 %s 已重新启动，新任务为 %s。", jobID, job.ID),
+					map[string]any{"job": job, "sourceJobId": job.ParentJobID},
+				), nil
+			},
+		},
+		{
 			Name:        "list_recent_jobs",
-			Description: "列出最近 MCP 长任务。参数 limit 可选，默认 20。",
+			Description: "列出最近 MCP 长任务。参数 limit 可选，默认 20；使用 cursor 分页获取更早任务。",
 			InputSchema: objectSchema(
 				map[string]any{
-					"limit": map[string]any{"type": "integer", "description": "最多返回多少个 job，默认 20，最大 20"},
+					"limit":  map[string]any{"type": "integer", "description": "最多返回多少个 job，默认 20，最大 20"},
+					"cursor": map[string]any{"type": "string", "description": "上一页返回的 nextCursor"},
 				},
 				[]string{},
 			),
@@ -272,11 +296,19 @@ func newImportTools(appService AppServiceReader) []ToolDefinition {
 			PermissionLevel: ToolPermissionReadOnly,
 			Handler: func(ctx context.Context, args map[string]any) (ToolCallResult, error) {
 				caller := principalFromContext(ctx)
-				jobs := listRecentMCPJobsAs(appService, optionalIntArg(args, "limit"), caller)
+				page, err := listMCPJobsPageAs(appService, optionalIntArg(args, "limit"), optionalStringArg(args, "cursor"), caller)
+				if err != nil {
+					return ToolCallResult{}, err
+				}
+				jobs := page.Items
 				for index := range jobs {
 					jobs[index] = sanitizeMCPJob(jobs[index])
 				}
-				return NewTextResult(formatMCPJobListText(jobs), map[string]any{"jobs": jobs}), nil
+				data := map[string]any{"jobs": jobs}
+				if page.NextCursor != "" {
+					data["nextCursor"] = page.NextCursor
+				}
+				return NewTextResult(formatMCPJobListText(jobs), data), nil
 			},
 		},
 	}

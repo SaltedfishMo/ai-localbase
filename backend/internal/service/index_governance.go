@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -18,6 +19,7 @@ import (
 const maxIndexHistoryRecords = 50
 
 const (
+	indexErrorDuplicate               = "duplicate_document"
 	indexErrorSourceMissing           = "source_missing"
 	indexErrorSourceChanged           = "source_changed"
 	indexErrorSourceUnreadable        = "source_unreadable"
@@ -25,6 +27,40 @@ const (
 	indexErrorRuleOutdated            = "index_rule_outdated"
 	indexErrorFailed                  = "index_failed"
 )
+
+// DuplicateDocumentError reports an idempotency conflict without exposing the
+// stored document path or checksum to API callers.
+type DuplicateDocumentError struct {
+	Existing model.Document
+}
+
+func (e *DuplicateDocumentError) Error() string {
+	if e == nil || strings.TrimSpace(e.Existing.ID) == "" {
+		return "document already exists in knowledge base"
+	}
+	return fmt.Sprintf("document already exists in knowledge base: %s", e.Existing.ID)
+}
+
+// IndexCleanupError indicates that a document could not be removed from the
+// vector index. The document remains in application state so the operation
+// can be retried without leaving an invisible, searchable document behind.
+type IndexCleanupError struct {
+	Err error
+}
+
+func (e *IndexCleanupError) Error() string {
+	if e == nil || e.Err == nil {
+		return "document index cleanup failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *IndexCleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 func currentKnowledgeBaseIndexVersion(knowledgeBase model.KnowledgeBase) int {
 	if knowledgeBase.CurrentIndexVersion > 0 {
@@ -41,6 +77,7 @@ func indexedOrDocument(indexed, document model.Document) model.Document {
 }
 
 func enrichDocumentGovernance(document model.Document) model.Document {
+	document.Name = normalizeDocumentName(document.Name)
 	if strings.TrimSpace(document.Source) == "" {
 		document.Source = "upload"
 	}
@@ -53,6 +90,19 @@ func enrichDocumentGovernance(document model.Document) model.Document {
 		}
 	}
 	return document
+}
+
+func normalizeDocumentName(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	if normalized, err := util.NormalizeFilename(name); err == nil {
+		return normalized
+	}
+	if fallback := util.SanitizeFilename(name); fallback != "" {
+		return fallback
+	}
+	return "document"
 }
 
 func checksumFile(path string) (string, error) {
@@ -90,6 +140,10 @@ func classifyIndexError(err error) string {
 	if err == nil {
 		return ""
 	}
+	var duplicateErr *DuplicateDocumentError
+	if errors.As(err, &duplicateErr) {
+		return indexErrorDuplicate
+	}
 	if errors.Is(err, fs.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "source file unavailable") || strings.Contains(strings.ToLower(err.Error()), "no such file") {
 		return indexErrorSourceMissing
 	}
@@ -112,6 +166,8 @@ func publicIndexError(code string) string {
 	switch strings.TrimSpace(code) {
 	case "":
 		return ""
+	case indexErrorDuplicate:
+		return "相同内容的文档已存在"
 	case indexErrorSourceMissing:
 		return "原文文件不可用"
 	case indexErrorSourceChanged:
@@ -161,6 +217,7 @@ func publicIndexRunRecords(records []model.IndexRunRecord) []model.IndexRunRecor
 }
 
 func publicDocument(document model.Document) model.Document {
+	document.Name = normalizeDocumentName(document.Name)
 	code := documentIndexErrorCode(document)
 	document.IndexErrorCode = code
 	document.IndexError = publicIndexError(code)
@@ -216,6 +273,22 @@ func (s *AppService) recordIndexRun(
 	status string,
 	err error,
 ) string {
+	return s.recordIndexRunWithContext(context.Background(), knowledgeBaseID, document, trigger, startedAt, status, err)
+}
+
+func (s *AppService) recordIndexRunWithContext(
+	ctx context.Context,
+	knowledgeBaseID string,
+	document model.Document,
+	trigger string,
+	startedAt time.Time,
+	status string,
+	err error,
+) string {
+	ctx = normalizeServiceContext(ctx)
+	if leaseErr := s.ensureIndexOperationLease(ctx); leaseErr != nil {
+		return ""
+	}
 	document = enrichDocumentGovernance(document)
 	if s == nil || s.state == nil {
 		return ""
@@ -240,6 +313,21 @@ func (s *AppService) recordIndexRun(
 	s.state.Mu.Lock()
 	kb, ok := s.state.KnowledgeBases[record.KnowledgeBaseID]
 	if ok {
+		previous := cloneKnowledgeBases(map[string]model.KnowledgeBase{record.KnowledgeBaseID: kb})[record.KnowledgeBaseID]
+		if documentID := strings.TrimSpace(document.ID); documentID != "" {
+			incomingFence := strings.TrimSpace(document.IndexFence)
+			for _, currentDocument := range kb.Documents {
+				if strings.TrimSpace(currentDocument.ID) != documentID {
+					continue
+				}
+				currentFence := strings.TrimSpace(currentDocument.IndexFence)
+				if incomingFence != "" && currentFence != "" && incomingFence != currentFence {
+					s.state.Mu.Unlock()
+					return ""
+				}
+				break
+			}
+		}
 		kb.UpdatedAt = completedAt.Format(time.RFC3339)
 		if kb.CurrentIndexVersion == 0 {
 			kb.CurrentIndexVersion = currentIndexVersion
@@ -266,6 +354,11 @@ func (s *AppService) recordIndexRun(
 			}
 		}
 		s.state.KnowledgeBases[record.KnowledgeBaseID] = kb
+		if leaseErr := s.ensureIndexOperationLease(ctx); leaseErr != nil {
+			s.state.KnowledgeBases[record.KnowledgeBaseID] = previous
+			s.state.Mu.Unlock()
+			return ""
+		}
 	}
 	s.state.Mu.Unlock()
 

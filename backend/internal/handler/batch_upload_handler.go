@@ -60,8 +60,22 @@ func (h *AppHandler) BatchIndexDocuments(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "uploadIds cannot be empty")
 		return
 	}
+	if err := service.ValidateBatchIndexInputs(req.UploadIDs); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	concurrency, err := service.ValidateMCPBatchConcurrency(req.Concurrency)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	owner := auth.PrincipalFromContext(c)
+	if err := h.appService.ValidateBatchIndexInputBytes(req.UploadIDs, owner); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	if req.Async {
-		job, err := h.appService.StartBatchIndexJobAs(knowledgeBaseID, req.UploadIDs, req.Concurrency, auth.PrincipalFromContext(c))
+		job, err := h.appService.StartBatchIndexJobAs(knowledgeBaseID, req.UploadIDs, concurrency, owner)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
 			return
@@ -70,19 +84,10 @@ func (h *AppHandler) BatchIndexDocuments(c *gin.Context) {
 		return
 	}
 
-	// 设置默认并发数
-	concurrency := req.Concurrency
-	if concurrency <= 0 {
-		concurrency = 3 // 默认3个并发
-	}
-	if concurrency > 10 {
-		concurrency = 10 // 最大10个并发
-	}
-
 	start := time.Now()
 
 	// 批量索引
-	results := h.batchIndexFromStaged(knowledgeBaseID, req.UploadIDs, concurrency, auth.PrincipalFromContext(c))
+	results := h.batchIndexFromStaged(c.Request.Context(), knowledgeBaseID, req.UploadIDs, concurrency, owner)
 
 	// 统计结果
 	successful := 0
@@ -107,25 +112,42 @@ func (h *AppHandler) BatchIndexDocuments(c *gin.Context) {
 }
 
 // batchIndexFromStaged 从暂存文件批量索引
-func (h *AppHandler) batchIndexFromStaged(knowledgeBaseID string, uploadIDs []string, concurrency int, owner service.AuthPrincipal) []IndexResult {
-	sem := make(chan struct{}, concurrency)
+func (h *AppHandler) batchIndexFromStaged(ctx context.Context, knowledgeBaseID string, uploadIDs []string, concurrency int, owner service.AuthPrincipal) []IndexResult {
+	if err := service.ValidateBatchIndexInputs(uploadIDs); err != nil {
+		return []IndexResult{{Success: false, ErrorCode: "invalid_argument", Error: err.Error()}}
+	}
+	validatedConcurrency, err := service.ValidateMCPBatchConcurrency(concurrency)
+	if err != nil {
+		return []IndexResult{{Success: false, ErrorCode: "invalid_argument", Error: err.Error()}}
+	}
+	concurrency = validatedConcurrency
 	var wg sync.WaitGroup
 	resultChan := make(chan IndexResult, len(uploadIDs))
-
-	for _, uploadID := range uploadIDs {
-		wg.Add(1)
-		go func(uid string) {
-			defer wg.Done()
-
-			// 获取信号量
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			// 索引单个文档
-			result := h.indexSingleStaged(knowledgeBaseID, uid, owner)
-			resultChan <- result
-		}(uploadID)
+	work := make(chan string)
+	workerCount := concurrency
+	if len(uploadIDs) < workerCount {
+		workerCount = len(uploadIDs)
 	}
+	for index := 0; index < workerCount; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for uploadID := range work {
+				resultChan <- h.indexSingleStaged(ctx, knowledgeBaseID, uploadID, owner)
+			}
+		}()
+	}
+	go func() {
+		for _, uploadID := range uploadIDs {
+			select {
+			case work <- uploadID:
+			case <-ctx.Done():
+				close(work)
+				return
+			}
+		}
+		close(work)
+	}()
 
 	// 等待所有goroutine完成
 	wg.Wait()
@@ -141,9 +163,9 @@ func (h *AppHandler) batchIndexFromStaged(knowledgeBaseID string, uploadIDs []st
 }
 
 // indexSingleStaged 索引单个暂存文件
-func (h *AppHandler) indexSingleStaged(knowledgeBaseID, uploadID string, owner service.AuthPrincipal) IndexResult {
+func (h *AppHandler) indexSingleStaged(ctx context.Context, knowledgeBaseID, uploadID string, owner service.AuthPrincipal) IndexResult {
 	// 使用现有的 RegisterStagedUpload 方法
-	document, err := h.appService.RegisterStagedUploadAs(context.Background(), uploadID, knowledgeBaseID, "", owner)
+	document, err := h.appService.RegisterStagedUploadAs(ctx, uploadID, knowledgeBaseID, "", owner)
 
 	if err != nil {
 		code, message := service.PublicIndexFailure(err)

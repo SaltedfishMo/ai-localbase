@@ -13,19 +13,21 @@ import (
 )
 
 type persistentAppState struct {
-	Config         model.AppConfig                         `json:"config"`
-	KnowledgeBases map[string]model.KnowledgeBase          `json:"knowledgeBases"`
-	EvalDatasets   map[string]model.EvalDataset            `json:"evalDatasets,omitempty"`
-	EvalRuns       map[string]model.RunEvalDatasetResponse `json:"evalRuns,omitempty"`
-	Auth           model.AuthState                         `json:"auth,omitempty"`
+	Config            model.AppConfig                         `json:"config"`
+	KnowledgeBases    map[string]model.KnowledgeBase          `json:"knowledgeBases"`
+	EvalDatasets      map[string]model.EvalDataset            `json:"evalDatasets,omitempty"`
+	EvalRuns          map[string]model.RunEvalDatasetResponse `json:"evalRuns,omitempty"`
+	IndexCleanupTasks []model.IndexCleanupTask                `json:"indexCleanupTasks,omitempty"`
+	Auth              model.AuthState                         `json:"auth,omitempty"`
 }
 
 type persistedAppStateJSON struct {
-	Config         model.AppConfig                         `json:"config"`
-	KnowledgeBases map[string]persistedKnowledgeBase       `json:"knowledgeBases"`
-	EvalDatasets   map[string]model.EvalDataset            `json:"evalDatasets,omitempty"`
-	EvalRuns       map[string]model.RunEvalDatasetResponse `json:"evalRuns,omitempty"`
-	Auth           model.AuthState                         `json:"auth,omitempty"`
+	Config            model.AppConfig                         `json:"config"`
+	KnowledgeBases    map[string]persistedKnowledgeBase       `json:"knowledgeBases"`
+	EvalDatasets      map[string]model.EvalDataset            `json:"evalDatasets,omitempty"`
+	EvalRuns          map[string]model.RunEvalDatasetResponse `json:"evalRuns,omitempty"`
+	IndexCleanupTasks []model.IndexCleanupTask                `json:"indexCleanupTasks,omitempty"`
+	Auth              model.AuthState                         `json:"auth,omitempty"`
 }
 
 type persistedKnowledgeBase struct {
@@ -59,9 +61,14 @@ type persistedDocument struct {
 	IndexErrorCode          string `json:"indexErrorCode,omitempty"`
 	IndexRunID              string `json:"indexRunId,omitempty"`
 	IndexVersion            int    `json:"indexVersion,omitempty"`
+	DeletionPending         bool   `json:"deletionPending,omitempty"`
 	IndexedContentAvailable bool   `json:"indexedContentAvailable,omitempty"`
 	IndexedContentChars     int    `json:"indexedContentChars,omitempty"`
 	IndexedTablesCount      int    `json:"indexedTablesCount,omitempty"`
+	IndexFence              string `json:"indexFence,omitempty"`
+	IndexOperationFence     string `json:"indexOperationFence,omitempty"`
+	IndexOperationOwner     string `json:"indexOperationOwner,omitempty"`
+	IndexOperationAttempt   int    `json:"indexOperationAttempt,omitempty"`
 }
 
 func (s persistentAppState) MarshalJSON() ([]byte, error) {
@@ -84,11 +91,12 @@ func (s persistentAppState) MarshalJSON() ([]byte, error) {
 		}
 	}
 	return json.Marshal(persistedAppStateJSON{
-		Config:         s.Config,
-		KnowledgeBases: knowledgeBases,
-		EvalDatasets:   s.EvalDatasets,
-		EvalRuns:       s.EvalRuns,
-		Auth:           s.Auth,
+		Config:            s.Config,
+		KnowledgeBases:    knowledgeBases,
+		EvalDatasets:      s.EvalDatasets,
+		EvalRuns:          s.EvalRuns,
+		IndexCleanupTasks: cloneIndexCleanupTasks(s.IndexCleanupTasks),
+		Auth:              s.Auth,
 	})
 }
 
@@ -104,8 +112,24 @@ func (s *persistentAppState) UnmarshalJSON(data []byte) error {
 	}
 	s.EvalDatasets = raw.EvalDatasets
 	s.EvalRuns = raw.EvalRuns
+	s.IndexCleanupTasks = cloneIndexCleanupTasks(raw.IndexCleanupTasks)
 	s.Auth = raw.Auth
 	return nil
+}
+
+func cloneIndexCleanupTasks(source []model.IndexCleanupTask) []model.IndexCleanupTask {
+	if source == nil {
+		return nil
+	}
+	cloned := make([]model.IndexCleanupTask, len(source))
+	for index, task := range source {
+		cloned[index] = task
+		task.DocumentIDs = append([]string(nil), task.DocumentIDs...)
+		task.PointIDs = append([]any(nil), task.PointIDs...)
+		task.SourcePaths = append([]string(nil), task.SourcePaths...)
+		cloned[index] = task
+	}
+	return cloned
 }
 
 func migratePersistedKnowledgeBase(mapKey string, raw persistedKnowledgeBase) model.KnowledgeBase {
@@ -177,7 +201,7 @@ func persistedDocumentFromModel(document model.Document) persistedDocument {
 	return persistedDocument{
 		ID:                      document.ID,
 		KnowledgeBaseID:         document.KnowledgeBaseID,
-		Name:                    document.Name,
+		Name:                    normalizeDocumentName(document.Name),
 		Size:                    document.Size,
 		SizeLabel:               document.SizeLabel,
 		UploadedAt:              document.UploadedAt,
@@ -193,9 +217,14 @@ func persistedDocumentFromModel(document model.Document) persistedDocument {
 		IndexErrorCode:          document.IndexErrorCode,
 		IndexRunID:              document.IndexRunID,
 		IndexVersion:            document.IndexVersion,
+		DeletionPending:         document.DeletionPending,
 		IndexedContentAvailable: document.IndexedContentAvailable,
 		IndexedContentChars:     document.IndexedContentChars,
 		IndexedTablesCount:      document.IndexedTablesCount,
+		IndexFence:              strings.TrimSpace(document.IndexFence),
+		IndexOperationFence:     strings.TrimSpace(document.IndexOperationFence),
+		IndexOperationOwner:     strings.TrimSpace(document.IndexOperationOwner),
+		IndexOperationAttempt:   document.IndexOperationAttempt,
 	}
 }
 
@@ -203,7 +232,7 @@ func documentToModel(document persistedDocument) model.Document {
 	return model.Document{
 		ID:                      document.ID,
 		KnowledgeBaseID:         document.KnowledgeBaseID,
-		Name:                    document.Name,
+		Name:                    normalizeDocumentName(document.Name),
 		Size:                    document.Size,
 		SizeLabel:               document.SizeLabel,
 		UploadedAt:              document.UploadedAt,
@@ -219,9 +248,14 @@ func documentToModel(document persistedDocument) model.Document {
 		IndexErrorCode:          document.IndexErrorCode,
 		IndexRunID:              document.IndexRunID,
 		IndexVersion:            document.IndexVersion,
+		DeletionPending:         document.DeletionPending,
 		IndexedContentAvailable: document.IndexedContentAvailable,
 		IndexedContentChars:     document.IndexedContentChars,
 		IndexedTablesCount:      document.IndexedTablesCount,
+		IndexFence:              strings.TrimSpace(document.IndexFence),
+		IndexOperationFence:     strings.TrimSpace(document.IndexOperationFence),
+		IndexOperationOwner:     strings.TrimSpace(document.IndexOperationOwner),
+		IndexOperationAttempt:   document.IndexOperationAttempt,
 	}
 }
 

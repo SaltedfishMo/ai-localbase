@@ -29,6 +29,13 @@ func TestEnrichDocumentGovernanceAddsSourceVersionAndChecksum(t *testing.T) {
 	}
 }
 
+func TestEnrichDocumentGovernanceNormalizesDocumentName(t *testing.T) {
+	document := enrichDocumentGovernance(model.Document{Name: `/Users/alice/uploads/guide.md`})
+	if document.Name != "guide.md" {
+		t.Fatalf("expected document name to be reduced to a basename, got %q", document.Name)
+	}
+}
+
 func TestVerifyDocumentSourceDetectsChangedContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "notes.txt")
 	if err := os.WriteFile(path, []byte("第一版"), 0o600); err != nil {
@@ -111,6 +118,14 @@ func TestDocumentNeedsReindexWhenOnlyErrorCodeIsPresent(t *testing.T) {
 	}
 	if !documentNeedsReindex(document, health) {
 		t.Fatal("expected an error-coded document to require reindex")
+	}
+}
+
+func TestIndexCleanupErrorPreservesUnderlyingCause(t *testing.T) {
+	underlying := errors.New("delete qdrant points failed")
+	err := &IndexCleanupError{Err: underlying}
+	if !errors.Is(err, underlying) {
+		t.Fatalf("expected cleanup error to unwrap underlying cause, got %v", err)
 	}
 }
 

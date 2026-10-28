@@ -90,13 +90,16 @@ Docker 自托管建议设置：
 
 - `ENABLE_AUTH=true`：开启 Web 登录与 API Key 鉴权。
 - `AUTH_USERNAME=root`：默认 root 用户名。
-- `AUTH_PASSWORD=<强密码>`：首次启动自动创建 root 用户。
+- `AUTH_PASSWORD=<强密码（至少 8 个字符）>`：首次启动自动创建 root 用户；不符合密码要求时后端拒绝初始化。
 - `AUTH_SETUP_TOKEN=<随机值>`：如果不使用 `AUTH_PASSWORD`，建议设置初始化保护 Token。
 - `QDRANT_BIND_ADDRESS=127.0.0.1`：默认只允许宿主机本机访问 Qdrant 端口，避免服务器部署时暴露向量库。
 - `MAX_UPLOAD_BYTES=26214400`：默认单文件上传上限为 25 MiB，可按资源情况调大。
 - `NGINX_CLIENT_MAX_BODY_SIZE=32m`：Docker 前端代理请求体上限，需要高于单文件上传上限以容纳 multipart 开销。
+- `/health`、`/livez` 和 `/readyz` 仅提供最小探针响应；登录后可在 Settings 查看详细健康诊断。
+- `API_REQUESTS_PER_MINUTE=120`：Chat、检索、评估、索引、上传和模型测试等每个资源类别的主体/IP 每分钟请求上限，各类别分别计算。
+- `API_MAX_CONCURRENT_REQUESTS=16`：上述高成本接口的全局并发上限；各类别还可通过对应的 `*_MAX_CONCURRENT_REQUESTS` 单独调整。
 
-普通和生产 Docker Compose 默认启用认证；如果 `ENABLE_AUTH=true` 且未设置 `AUTH_PASSWORD`，首次访问 Web 页面会进入初始化向导。服务器部署请优先设置 `AUTH_PASSWORD` 或 `AUTH_SETUP_TOKEN`，避免初始化窗口被他人抢占。开发 Compose 如需免登录调试，请显式设置 `ENABLE_AUTH=false`。
+普通和生产 Docker Compose 默认启用认证；如果 `ENABLE_AUTH=true` 且未设置 `AUTH_PASSWORD`，首次访问 Web 页面会进入初始化向导。`AUTH_PASSWORD` 至少需要 8 个字符，不符合要求时后端拒绝创建 root 用户。服务器部署请优先设置 `AUTH_PASSWORD` 或 `AUTH_SETUP_TOKEN`，避免初始化窗口被他人抢占。开发 Compose 如需免登录调试，请显式设置 `ENABLE_AUTH=false`。
 
 默认服务地址：
 
@@ -109,16 +112,18 @@ Docker 自托管建议设置：
 
 生产 Compose 已配置容器自动重启、日志轮转和资源上限。后端业务进程以非 root 用户运行，首次启动会自动修正持久化数据目录的文件属主并写入迁移标记；相关资源变量见 [`DOCKER_DEPLOY.md`](DOCKER_DEPLOY.md)。如果外层还有受控 HTTPS 反向代理，请设置 `TRUST_EXTERNAL_PROXY_HEADERS=true` 并保留 `X-Forwarded-Proto` 和 `X-Forwarded-Host`；前端端口直接暴露时保持默认值 `false`。
 
-当前应用层按**单实例**设计：本地 SQLite 聊天记录、应用状态文件和内存中的 MCP Job 不支持多个后端副本共享写入。生产 Compose 默认使用已发布的固定 `v1.4.6` 镜像版本，升级或回滚时通过 `AI_LOCALBASE_IMAGE_TAG` 显式切换；本地源码修改请使用开发或本地构建编排验证，不要直接依赖 `latest`，也不要使用 `docker compose scale backend=2`。
+当前应用层按**单实例**设计：本地 SQLite 聊天记录、应用状态文件和内存中的 MCP Job 不支持多个后端副本共享写入。生产 Compose 默认使用已发布的固定 `v1.4.11` 镜像版本，升级或回滚时通过 `AI_LOCALBASE_IMAGE_TAG` 显式切换；本地源码修改请使用开发或本地构建编排验证，不要直接依赖 `latest`，也不要使用 `docker compose scale backend=2`。
 
 默认数据目录由 `.env` 控制，主要包括上传文件、应用状态、聊天 SQLite 数据库和 Qdrant 持久化目录。升级或迁移前建议先备份这些路径，详见 [`docs/backup-restore.md`](docs/backup-restore.md)。
+
+Docker 重启、健康检查和外部模型/Qdrant 故障排查见 [`docs/docker-operations.md`](docs/docker-operations.md)。
 
 ### 使用预构建镜像部署
 
 如果不想本地编译，可直接使用预构建镜像：
 
 ```bash
-AI_LOCALBASE_IMAGE_TAG=v1.4.6 docker compose -f docker-compose.prod.yml up -d
+AI_LOCALBASE_IMAGE_TAG=v1.4.11 docker compose -f docker-compose.prod.yml up -d
 ```
 
 生产 Compose 在未提供 `ENABLE_AUTH` 时默认开启认证；如果使用 `.env.example`，请在启动前确认 `ENABLE_AUTH=true`，并设置 `AUTH_PASSWORD` 或 `AUTH_SETUP_TOKEN`。后端默认只绑定宿主机本机，浏览器通过前端 `4173` 端口访问；如确需直接访问后端，再显式设置 `BACKEND_BIND_ADDRESS=0.0.0.0`。

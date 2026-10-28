@@ -43,7 +43,7 @@ services:
     pids_limit: ${QDRANT_PIDS_LIMIT:-512}
 
   backend:
-    image: ghcr.io/veyliss/ai-localbase-backend:${AI_LOCALBASE_IMAGE_TAG:-v1.4.6}
+    image: ghcr.io/veyliss/ai-localbase-backend:${AI_LOCALBASE_IMAGE_TAG:-v1.4.11}
     container_name: ai-localbase-backend
     restart: unless-stopped
     ports:
@@ -60,6 +60,7 @@ services:
       - MAX_JSON_BODY_BYTES=${MAX_JSON_BODY_BYTES:-4194304}
       - STATE_FILE=${STATE_FILE:-/app/data/app-state.json}
       - CHAT_HISTORY_FILE=${CHAT_HISTORY_FILE:-/app/data/chat-history.db}
+      - MCP_JOB_STORE_FILE=${MCP_JOB_STORE_FILE:-/app/data/mcp-jobs.db}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_COLLECTION_PREFIX=${QDRANT_COLLECTION_PREFIX:-kb_}
@@ -91,6 +92,13 @@ services:
       - MCP_BASE_PATH=${MCP_BASE_PATH:-/mcp}
       - MCP_REQUEST_TIMEOUT_SECONDS=${MCP_REQUEST_TIMEOUT_SECONDS:-15}
       - MCP_REQUESTS_PER_MINUTE=${MCP_REQUESTS_PER_MINUTE:-120}
+      - API_REQUESTS_PER_MINUTE=${API_REQUESTS_PER_MINUTE:-120}
+      - API_MAX_CONCURRENT_REQUESTS=${API_MAX_CONCURRENT_REQUESTS:-16}
+      - CHAT_MAX_CONCURRENT_REQUESTS=${CHAT_MAX_CONCURRENT_REQUESTS:-4}
+      - INDEX_MAX_CONCURRENT_REQUESTS=${INDEX_MAX_CONCURRENT_REQUESTS:-2}
+      - EVAL_MAX_CONCURRENT_REQUESTS=${EVAL_MAX_CONCURRENT_REQUESTS:-1}
+      - UPLOAD_MAX_CONCURRENT_REQUESTS=${UPLOAD_MAX_CONCURRENT_REQUESTS:-4}
+      - MODEL_TEST_MAX_CONCURRENT_REQUESTS=${MODEL_TEST_MAX_CONCURRENT_REQUESTS:-2}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -112,7 +120,7 @@ services:
     pids_limit: ${BACKEND_PIDS_LIMIT:-256}
 
   frontend:
-    image: ghcr.io/veyliss/ai-localbase-frontend:${AI_LOCALBASE_IMAGE_TAG:-v1.4.6}
+    image: ghcr.io/veyliss/ai-localbase-frontend:${AI_LOCALBASE_IMAGE_TAG:-v1.4.11}
     container_name: ai-localbase-frontend
     restart: unless-stopped
     ports:
@@ -122,7 +130,6 @@ services:
         condition: service_healthy
     environment:
       - NGINX_BACKEND_PORT=${PORT:-8080}
-      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8080}
       - NGINX_TRUST_EXTERNAL_PROXY_HEADERS=${TRUST_EXTERNAL_PROXY_HEADERS:-false}
       - NGINX_CLIENT_MAX_BODY_SIZE=${NGINX_CLIENT_MAX_BODY_SIZE:-32m}
     extra_hosts:

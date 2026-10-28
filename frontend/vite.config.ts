@@ -1,3 +1,4 @@
+import path from 'node:path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
@@ -8,16 +9,47 @@ const backendProxy = {
   xfwd: true,
 }
 
+const normalizedModuleId = (id: string) => id.split(path.sep).join('/')
+
+// Keep chart engines and layout plugins cacheable without pulling them into the
+// chat entry. Mermaid still decides which diagram definition is loaded on demand.
+const manualChunks = (id: string) => {
+  const moduleId = normalizedModuleId(id)
+
+  if (moduleId.includes('/node_modules/react/') || moduleId.includes('/node_modules/react-dom/')) {
+    return 'react'
+  }
+  if (
+    moduleId.includes('/node_modules/react-markdown/') ||
+    moduleId.includes('/node_modules/remark-gfm/')
+  ) {
+    return 'markdown'
+  }
+
+  if (
+    moduleId.includes('/node_modules/cytoscape-cose-bilkent/')
+  ) {
+    return 'diagram-cytoscape-cose'
+  }
+  if (moduleId.includes('/node_modules/cytoscape-fcose/')) {
+    return 'diagram-cytoscape-fcose'
+  }
+  if (moduleId.includes('/node_modules/cytoscape/')) {
+    return 'diagram-cytoscape'
+  }
+
+  return undefined
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
   build: {
+    // Chunk budgets are enforced by the build script below so exceptions stay
+    // explicit and reviewable instead of being hidden by Vite's warning limit.
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom'],
-          markdown: ['react-markdown', 'remark-gfm'],
-        },
+        manualChunks,
       },
     },
   },

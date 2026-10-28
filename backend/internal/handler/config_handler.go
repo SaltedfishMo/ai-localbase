@@ -60,11 +60,11 @@ type HealthSummaryResponse struct {
 	EmbeddingModel ComponentHealth `json:"embedding_model"`
 	Storage        ComponentHealth `json:"storage"`
 	Auth           ComponentHealth `json:"auth"`
+	MCPJobStore    ComponentHealth `json:"mcp_job_store"`
 }
 
 type ReadinessResponse struct {
-	Status string                     `json:"status"`
-	Checks map[string]ComponentHealth `json:"checks"`
+	Status string `json:"status"`
 }
 
 type ComponentHealth struct {
@@ -94,7 +94,7 @@ func (h *ConfigHandler) TestChatModel(c *gin.Context) {
 
 	// 调用聊天接口
 	apiKey := h.resolveChatAPIKey(req.APIKey, req.Provider, req.BaseURL)
-	response, err := llmService.Chat(model.ChatCompletionRequest{
+	response, err := llmService.ChatWithContext(c.Request.Context(), model.ChatCompletionRequest{
 		Messages: testMessages,
 		Config: model.ChatModelConfig{
 			Provider:    req.Provider,
@@ -261,6 +261,9 @@ func (h *ConfigHandler) HealthSummary(c *gin.Context) {
 	// 5. 检查认证部署建议
 	summary.Auth = h.checkAuthHealth()
 
+	// 6. 检查 MCP 任务持久化。MCP 默认关闭时明确标记为未配置。
+	summary.MCPJobStore = h.checkMCPJobStoreHealth()
+
 	c.JSON(http.StatusOK, summary)
 }
 
@@ -273,25 +276,65 @@ func (h *ConfigHandler) Readiness(c *gin.Context) {
 	checks := map[string]ComponentHealth{}
 	if h == nil || h.appService == nil {
 		checks["backend"] = ComponentHealth{Status: "error", ErrorMessage: "application service is unavailable"}
-		c.JSON(http.StatusServiceUnavailable, ReadinessResponse{Status: "not_ready", Checks: checks})
+		c.JSON(http.StatusServiceUnavailable, ReadinessResponse{Status: "not_ready"})
 		return
 	}
 
 	checks["qdrant"] = h.checkQdrantHealth(ctx)
 	checks["storage"] = h.checkStorageHealth()
+	checks["upload_staging"] = h.checkUploadStagingHealth()
 	config := h.appService.GetConfig()
 	checks["chat_model"] = modelConfigurationHealth("chat", config.Chat.BaseURL, config.Chat.Model)
 	checks["embedding_model"] = modelConfigurationHealth("embedding", config.Embedding.BaseURL, config.Embedding.Model)
+	if h.appService.ServerConfig().EnableMCP {
+		checks["mcp_job_store"] = h.checkMCPJobStoreHealth()
+	}
 
 	qdrantReady := checks["qdrant"].Status == "ok" || checks["qdrant"].Status == "not_configured"
-	ready := qdrantReady && checks["storage"].Status == "ok"
+	mcpJobStoreReady := checks["mcp_job_store"].Status == "ok" || checks["mcp_job_store"].Status == "warning" || checks["mcp_job_store"].Status == ""
+	ready := qdrantReady && checks["storage"].Status == "ok" && checks["upload_staging"].Status == "ok" && mcpJobStoreReady
 	status := "not_ready"
 	statusCode := http.StatusServiceUnavailable
 	if ready {
 		status = "ready"
 		statusCode = http.StatusOK
 	}
-	c.JSON(statusCode, ReadinessResponse{Status: status, Checks: checks})
+	c.JSON(statusCode, ReadinessResponse{Status: status})
+}
+
+func (h *ConfigHandler) checkUploadStagingHealth() ComponentHealth {
+	if h == nil || h.appService == nil {
+		return ComponentHealth{Status: "error", ErrorMessage: "upload staging is unavailable"}
+	}
+	if err := h.appService.UploadStagingManifestLoadError(); err != nil {
+		return ComponentHealth{
+			Status:       "error",
+			Message:      "Upload staging manifest cannot be loaded",
+			ErrorMessage: "upload staging manifest is unavailable",
+		}
+	}
+	return ComponentHealth{Status: "ok", Message: "Upload staging is accessible"}
+}
+
+func (h *ConfigHandler) checkMCPJobStoreHealth() ComponentHealth {
+	if h == nil || h.appService == nil {
+		return ComponentHealth{Status: "error", ErrorMessage: "MCP job store is unavailable"}
+	}
+	if !h.appService.ServerConfig().EnableMCP {
+		return ComponentHealth{Status: "not_configured", Message: "MCP is not enabled"}
+	}
+
+	health := h.appService.GetMCPJobStoreHealth()
+	switch health.Status {
+	case "ok":
+		return ComponentHealth{Status: "ok", Message: "MCP job store is writable"}
+	case "warning":
+		return ComponentHealth{Status: "warning", Message: "MCP job store is writable; previous persistence failures were recorded"}
+	case "memory_only":
+		return ComponentHealth{Status: "error", Message: "MCP job store is not configured", ErrorMessage: "MCP job persistence is unavailable"}
+	default:
+		return ComponentHealth{Status: "error", Message: "MCP job store is unavailable", ErrorMessage: "MCP job persistence is unavailable"}
+	}
 }
 
 func modelConfigurationHealth(kind, baseURL, modelName string) ComponentHealth {
@@ -351,7 +394,7 @@ func (h *ConfigHandler) checkChatModelHealth(ctx context.Context) ComponentHealt
 		{Role: "user", Content: "Hi"},
 	}
 
-	response, err := llmService.Chat(model.ChatCompletionRequest{
+	response, err := llmService.ChatWithContext(ctx, model.ChatCompletionRequest{
 		Messages: testMessages,
 		Config: model.ChatModelConfig{
 			Provider:    config.Chat.Provider,

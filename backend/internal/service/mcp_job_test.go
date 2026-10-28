@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,149 @@ func TestMCPJobTerminalStatusIsNotOverwritten(t *testing.T) {
 	}
 	if job.Progress != 10 || job.Result != nil {
 		t.Fatalf("expected cancelled job details to stay unchanged, got %+v", job)
+	}
+}
+
+func TestCompleteMCPJobPersistsTruncatedResultWithoutChangingOutcome(t *testing.T) {
+	store := newTestMCPJobStore(t)
+	now := time.Now().UTC()
+	record := testMCPJobRecord("job-result-fallback", now)
+	if err := store.Create(record); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	claimed, ok, err := store.Claim(record.Job.ID, "worker-result", time.Minute, now)
+	if err != nil || !ok {
+		t.Fatalf("claim job: ok=%t err=%v", ok, err)
+	}
+
+	service := &AppService{
+		mcpJobs: map[string]model.MCPJob{record.Job.ID: claimed.Job},
+		mcpJobDescriptors: map[string]mcpJobDescriptor{
+			record.Job.ID: claimed.Descriptor,
+		},
+		mcpJobLeases: map[string]mcpJobLease{
+			record.Job.ID: {Owner: claimed.LeaseOwner, Attempt: claimed.Job.Attempt, ExpiresAt: claimed.LeaseExpiresAt},
+		},
+		mcpJobCancels:       map[string]context.CancelFunc{},
+		mcpJobStagingLeases: map[string]map[string]mcpStagingLease{},
+		mcpJobStore:         store,
+	}
+	service.completeMCPJob(record.Job.ID, "succeeded", 100, "任务完成。", map[string]any{
+		"results": oversizedMCPJobResult()["results"],
+	}, "")
+
+	loaded, found, err := store.Get(record.Job.ID)
+	if err != nil {
+		t.Fatalf("load completed job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected completed job to remain persisted")
+	}
+	if loaded.Job.Status != "succeeded" || loaded.Job.ErrorCode != "" {
+		t.Fatalf("expected successful outcome to remain successful, got %+v", loaded.Job)
+	}
+	if loaded.Job.Result["truncated"] != true {
+		t.Fatalf("expected oversized result to be persisted with a truncation marker, got %#v", loaded.Job.Result)
+	}
+	if service.mcpJobs[record.Job.ID].Result["truncated"] != true {
+		t.Fatalf("expected in-memory result to use the bounded representation, got %#v", service.mcpJobs[record.Job.ID].Result)
+	}
+}
+
+func TestMCPJobRenewsTrackedStagingLease(t *testing.T) {
+	service := NewAppService(nil, nil, nil, model.ServerConfig{StagingDir: t.TempDir()})
+	staged, err := service.staging.StageBytes("heartbeat.md", []byte("heartbeat content"), "test")
+	if err != nil {
+		t.Fatalf("stage upload: %v", err)
+	}
+	claimed, err := service.staging.ClaimWithLeaseAs(staged.ID, AuthPrincipal{}, "job-token", mcpJobLeaseDuration)
+	if err != nil {
+		t.Fatalf("claim upload: %v", err)
+	}
+	before, err := time.Parse(time.RFC3339Nano, claimed.ProcessingLeaseUntil)
+	if err != nil {
+		t.Fatalf("parse initial lease: %v", err)
+	}
+	service.mcpJobs["job-heartbeat"] = model.MCPJob{ID: "job-heartbeat", Status: "running"}
+	service.trackMCPStagingLease("job-heartbeat", claimed.ID, "job-token", claimed.ProcessingAttempt)
+
+	if !service.renewMCPJobStagingLeases("job-heartbeat") {
+		t.Fatal("expected tracked staging lease renewal to succeed")
+	}
+	renewed, err := service.staging.get(claimed.ID, true)
+	if err != nil {
+		t.Fatalf("get renewed upload: %v", err)
+	}
+	after, err := time.Parse(time.RFC3339Nano, renewed.ProcessingLeaseUntil)
+	if err != nil {
+		t.Fatalf("parse renewed lease: %v", err)
+	}
+	if !after.After(before) {
+		t.Fatalf("expected renewed lease to move forward: before=%s after=%s", before, after)
+	}
+	if after.Before(time.Now().UTC()) {
+		t.Fatalf("expected renewed lease to remain active: %s", after)
+	}
+	service.forgetMCPStagingLease("job-heartbeat", claimed.ID, "job-token", claimed.ProcessingAttempt)
+	if !service.renewMCPJobStagingLeases("job-heartbeat") {
+		t.Fatal("expected a lease forgotten after completion to be ignored")
+	}
+
+	consumed, err := service.staging.StageBytes("consumed.md", []byte("consumed content"), "test")
+	if err != nil {
+		t.Fatalf("stage consumed upload: %v", err)
+	}
+	consumedClaim, err := service.staging.ClaimWithLeaseAs(consumed.ID, AuthPrincipal{}, "job-token", mcpJobLeaseDuration)
+	if err != nil {
+		t.Fatalf("claim consumed upload: %v", err)
+	}
+	if err := service.staging.MarkConsumedWithLeaseAttempt(consumed.ID, "job-token", consumedClaim.ProcessingAttempt); err != nil {
+		t.Fatalf("consume upload: %v", err)
+	}
+	service.trackMCPStagingLease("job-heartbeat", consumed.ID, "job-token", consumedClaim.ProcessingAttempt)
+	if !service.renewMCPJobStagingLeases("job-heartbeat") {
+		t.Fatal("expected an already consumed lease to be ignored")
+	}
+}
+
+func TestMCPJobWorkerLeaseLossReleasesOldStagingLease(t *testing.T) {
+	store := newTestMCPJobStore(t)
+	service := NewAppService(nil, nil, nil, model.ServerConfig{StagingDir: t.TempDir()})
+	service.mcpJobStore = store
+	service.mcpJobMu.Lock()
+	service.mcpJobLeases["job-lease-loss"] = mcpJobLease{Owner: "old-worker", Attempt: 1}
+	service.mcpJobMu.Unlock()
+
+	staged, err := service.staging.StageBytes("lease-loss.md", []byte("lease loss content"), "test")
+	if err != nil {
+		t.Fatalf("stage upload: %v", err)
+	}
+	leaseOwner := service.mcpStagingLeaseOwnerForLease("job-lease-loss", mcpJobLease{Owner: "old-worker", Attempt: 1})
+	claimed, err := service.staging.ClaimWithLeaseAs(staged.ID, AuthPrincipal{}, leaseOwner, mcpJobLeaseDuration)
+	if err != nil {
+		t.Fatalf("claim staged upload: %v", err)
+	}
+	service.trackMCPStagingLeaseForJob("job-lease-loss", staged.ID, leaseOwner, claimed.ProcessingAttempt, 1)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close job store to simulate lease loss: %v", err)
+	}
+
+	service.runMCPJobWorkerWithHeartbeatInterval("job-lease-loss", context.Background(), func(ctx context.Context) {
+		<-ctx.Done()
+	}, time.Millisecond)
+
+	released, err := service.staging.Get(staged.ID)
+	if err != nil {
+		t.Fatalf("read released staged upload: %v", err)
+	}
+	if released.Status != stagedUploadStatusStaged || released.ProcessingOwner != "" {
+		t.Fatalf("expected old worker staging lease to be released, got %+v", released)
+	}
+	service.mcpJobMu.Lock()
+	_, tracked := service.mcpJobStagingLeases["job-lease-loss"][staged.ID]
+	service.mcpJobMu.Unlock()
+	if tracked {
+		t.Fatal("expected released staging lease to be removed from tracking")
 	}
 }
 
@@ -151,6 +295,10 @@ func TestMCPJobOwnerIsolation(t *testing.T) {
 				Status:      "succeeded",
 				OwnerUserID: "root-user",
 			},
+			"job-unbound": {
+				ID:     "job-unbound",
+				Status: "succeeded",
+			},
 		},
 	}
 
@@ -162,5 +310,134 @@ func TestMCPJobOwnerIsolation(t *testing.T) {
 	}
 	if jobs := service.ListRecentMCPJobsAs(20, AuthPrincipal{AuthType: "session", UserID: "root-user"}); len(jobs) != 1 || jobs[0].ID != "job-session" {
 		t.Fatalf("expected session owner to see only session jobs, got %+v", jobs)
+	}
+	legacy := AuthPrincipal{AuthType: "compatible_token"}
+	if _, err := service.GetMCPJobStatusAs("job-api-key", legacy); err == nil {
+		t.Fatal("expected legacy token to be denied another API key's job")
+	}
+	if _, err := service.GetMCPJobStatusAs("job-session", legacy); err == nil {
+		t.Fatal("expected legacy token to be denied a session-owned job")
+	}
+	if _, err := service.GetMCPJobStatusAs("job-unbound", legacy); err != nil {
+		t.Fatalf("expected legacy token to read an unbound historical job: %v", err)
+	}
+}
+
+func TestMCPJobStatusDoesNotResurrectPrunedDurableJobFromMemory(t *testing.T) {
+	store := newTestMCPJobStore(t)
+	job := testMCPJobRecord("job-pruned-cache", time.Now().UTC())
+	job.Job.Status = "succeeded"
+	if err := store.Create(job); err != nil {
+		t.Fatalf("create durable job: %v", err)
+	}
+	service := NewAppServiceWithJobStore(nil, NewAppStateStore(filepath.Join(t.TempDir(), "state.json")), nil, model.ServerConfig{}, store)
+	defer func() {
+		if err := service.ShutdownJobs(context.Background()); err != nil {
+			t.Errorf("shutdown service: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+
+	if _, err := service.GetMCPJobStatus(job.Job.ID); err != nil {
+		t.Fatalf("load durable job into memory: %v", err)
+	}
+	if err := store.Delete(job.Job.ID); err != nil {
+		t.Fatalf("prune durable job: %v", err)
+	}
+	if _, err := service.GetMCPJobStatus(job.Job.ID); err == nil || !strings.Contains(err.Error(), "job not found") {
+		t.Fatalf("expected pruned job to stay absent, got %v", err)
+	}
+}
+
+func TestRetryMCPJobCreatesChildWithRetryMetadata(t *testing.T) {
+	called := false
+	service := &AppService{
+		mcpJobs: map[string]model.MCPJob{
+			"job-failed": {
+				ID:         "job-failed",
+				Status:     "failed",
+				Retryable:  true,
+				RetryCount: 0,
+			},
+		},
+		mcpJobRetries: map[string]mcpJobRetryAction{
+			"job-failed": func() (model.MCPJob, error) {
+				called = true
+				return model.MCPJob{ID: "job-retry", Status: "queued", Retryable: true}, nil
+			},
+		},
+		mcpJobCancels: map[string]context.CancelFunc{},
+	}
+
+	job, err := service.RetryMCPJobAs("job-failed", AuthPrincipal{})
+	if err != nil {
+		t.Fatalf("retry failed job: %v", err)
+	}
+	if !called || job.ID != "job-retry" || job.ParentJobID != "job-failed" || job.RetryCount != 1 {
+		t.Fatalf("expected retry metadata, called=%t job=%+v", called, job)
+	}
+	if service.mcpJobs["job-failed"].Retryable {
+		t.Fatal("expected the source job to be non-retryable after creating a child")
+	}
+	calledBeforeDuplicate := called
+	if _, err := service.RetryMCPJobAs("job-failed", AuthPrincipal{}); err == nil {
+		t.Fatal("expected a source job to reject duplicate retry requests")
+	}
+	if called != calledBeforeDuplicate {
+		t.Fatal("expected duplicate retry request not to invoke the retry action")
+	}
+}
+
+func TestAdminRetryKeepsChildVisibleToOriginalOwner(t *testing.T) {
+	service := &AppService{
+		mcpJobs: map[string]model.MCPJob{
+			"job-owned-by-user": {
+				ID:          "job-owned-by-user",
+				Status:      "failed",
+				Retryable:   true,
+				OwnerUserID: "original-user",
+			},
+		},
+		mcpJobRetries: map[string]mcpJobRetryAction{
+			"job-owned-by-user": func() (model.MCPJob, error) {
+				return model.MCPJob{
+					ID:          "job-owned-by-user-retry",
+					Status:      "queued",
+					Retryable:   true,
+					OwnerUserID: "admin-user",
+				}, nil
+			},
+		},
+		mcpJobCancels: map[string]context.CancelFunc{},
+	}
+
+	admin := AuthPrincipal{AuthType: "session", UserID: "admin-user", Scopes: []string{"mcp:admin"}}
+	child, err := service.RetryMCPJobAs("job-owned-by-user", admin)
+	if err != nil {
+		t.Fatalf("admin retry: %v", err)
+	}
+	if child.OwnerUserID != "original-user" || child.OwnerAPIKeyID != "" {
+		t.Fatalf("expected retry child to retain original owner, got %+v", child)
+	}
+}
+
+func TestRetryMCPJobRejectsNonFailedAndExhaustedJobs(t *testing.T) {
+	service := &AppService{
+		mcpJobs: map[string]model.MCPJob{
+			"job-running":   {ID: "job-running", Status: "running", Retryable: true},
+			"job-exhausted": {ID: "job-exhausted", Status: "failed", Retryable: false, RetryCount: mcpJobMaxRetries},
+		},
+		mcpJobRetries: map[string]mcpJobRetryAction{
+			"job-running":   func() (model.MCPJob, error) { return model.MCPJob{}, nil },
+			"job-exhausted": func() (model.MCPJob, error) { return model.MCPJob{}, nil },
+		},
+	}
+
+	for _, jobID := range []string{"job-running", "job-exhausted"} {
+		if _, err := service.RetryMCPJobAs(jobID, AuthPrincipal{}); err == nil {
+			t.Fatalf("expected retry %s to be rejected", jobID)
+		}
 	}
 }

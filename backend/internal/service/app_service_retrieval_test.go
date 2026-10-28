@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,138 @@ import (
 
 	"ai-localbase/internal/model"
 )
+
+func TestWithCurrentIndexFenceFilterUsesValidTopLevelComposition(t *testing.T) {
+	service := &AppService{state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-filter": {
+			ID: "kb-filter",
+			Documents: []model.Document{
+				{ID: "doc-current", IndexFence: "index:current"},
+				{ID: "doc-legacy"},
+			},
+		},
+	}}}
+	base := map[string]any{
+		"must": []map[string]any{{
+			"key":   "knowledge_base_id",
+			"match": map[string]any{"value": "kb-filter"},
+		}},
+	}
+	filter := service.withCurrentIndexFenceFilter("kb-filter", base, "")
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatalf("encode composed filter: %v", err)
+	}
+	if strings.Contains(string(encoded), `"filter"`) {
+		t.Fatalf("expected Qdrant 1.13 compound conditions without filter wrappers, got %s", encoded)
+	}
+	must, ok := filter["must"].([]map[string]any)
+	if !ok || len(must) != 2 {
+		t.Fatalf("expected base condition and generation condition, got %#v", filter["must"])
+	}
+	generationCondition, ok := must[1]["should"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected generation alternatives under a compound should condition, got %#v", must[1])
+	}
+	branches := generationCondition
+	if !ok || len(branches) != 2 {
+		t.Fatalf("expected two document generation branches, got %#v", generationCondition)
+	}
+	legacyMust, ok := branches[1]["must"].([]map[string]any)
+	if !ok || len(legacyMust) != 1 {
+		t.Fatalf("expected legacy branch must to contain the document condition, got %#v", branches[1])
+	}
+	legacyShould, ok := branches[1]["should"].([]map[string]any)
+	if !ok || len(legacyShould) != 2 {
+		t.Fatalf("expected legacy branch to accept missing and empty fences, got %#v", branches[1])
+	}
+	if _, ok := legacyShould[0]["is_empty"]; !ok {
+		t.Fatalf("expected missing-fence condition, got %#v", legacyShould)
+	}
+	if value := legacyShould[1]["match"].(map[string]any)["value"]; value != "" {
+		t.Fatalf("expected empty-string fence condition, got %#v", legacyShould[1])
+	}
+}
+
+func TestRetrievalCacheScopeChangesWithIndexGeneration(t *testing.T) {
+	state := &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-cache": {
+			ID: "kb-cache",
+			Documents: []model.Document{{
+				ID:         "doc-1",
+				Status:     "indexed",
+				IndexFence: "index:old",
+			}},
+		},
+	}}
+	service := &AppService{state: state, serverConfig: model.ServerConfig{QdrantVectorSize: 768}}
+	req := model.ChatCompletionRequest{KnowledgeBaseID: "kb-cache", KnowledgeScope: KnowledgeScopeSelected}
+	before := service.retrievalCacheScope(req, []string{"kb-cache"})
+
+	state.Mu.Lock()
+	document := state.KnowledgeBases["kb-cache"].Documents[0]
+	document.IndexFence = "index:new"
+	state.KnowledgeBases["kb-cache"].Documents[0] = document
+	state.Mu.Unlock()
+
+	after := service.retrievalCacheScope(req, []string{"kb-cache"})
+	if before == after {
+		t.Fatal("expected index generation change to invalidate retrieval cache scope")
+	}
+}
+
+func TestRetrievalCacheScopeChangesWithEmbeddingConfig(t *testing.T) {
+	service := &AppService{state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-cache": {ID: "kb-cache"},
+	}}, serverConfig: model.ServerConfig{QdrantVectorSize: 768}}
+	req := model.ChatCompletionRequest{KnowledgeBaseID: "kb-cache", KnowledgeScope: KnowledgeScopeSelected}
+	req.Embedding.Provider = "ollama"
+	req.Embedding.BaseURL = "http://localhost:11434"
+	req.Embedding.Model = "nomic-embed-text"
+	before := service.retrievalCacheScope(req, []string{"kb-cache"})
+	req.Embedding.Model = "embedding-model-v2"
+	after := service.retrievalCacheScope(req, []string{"kb-cache"})
+	if before == after {
+		t.Fatal("expected embedding config change to invalidate retrieval cache scope")
+	}
+}
+
+func TestAppendIndexFenceMustUsesEmptyConditionForLegacyDocument(t *testing.T) {
+	filter := appendIndexFenceMust(map[string]any{
+		"must": []map[string]any{{"key": "document_id"}},
+	}, "")
+	must, ok := filter["must"].([]map[string]any)
+	if !ok || len(must) != 2 {
+		t.Fatalf("expected two must conditions, got %#v", filter["must"])
+	}
+	emptyShould, ok := must[1]["should"].([]map[string]any)
+	if !ok || len(emptyShould) != 2 {
+		t.Fatalf("expected missing and empty-string fence alternatives, got %#v", must[1])
+	}
+}
+
+func TestWithCurrentIndexFenceFilterScopesExplicitLegacyDocument(t *testing.T) {
+	service := &AppService{state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-filter": {
+			ID:        "kb-filter",
+			Documents: []model.Document{{ID: "doc-legacy"}},
+		},
+	}}}
+	filter := service.withCurrentIndexFenceFilter("kb-filter", map[string]any{
+		"must": []map[string]any{{
+			"key":   "document_id",
+			"match": map[string]any{"value": "doc-legacy"},
+		}},
+	}, "doc-legacy")
+	must, ok := filter["must"].([]map[string]any)
+	if !ok || len(must) != 2 {
+		t.Fatalf("expected explicit document filter to include empty-fence condition, got %#v", filter)
+	}
+	emptyShould, ok := must[1]["should"].([]map[string]any)
+	if !ok || len(emptyShould) != 2 {
+		t.Fatalf("expected explicit legacy filter to accept missing and empty-string fences, got %#v", must[1])
+	}
+}
 
 type recordingContextCompressor struct {
 	called int
@@ -762,7 +895,11 @@ func TestCollectCandidatesPreservesQdrantScoreAndChannels(t *testing.T) {
 
 	service := &AppService{
 		qdrant: NewQdrantService(model.ServerConfig{QdrantURL: server.URL, QdrantVectorSize: 2}),
-		state:  &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{}},
+		state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+			"kb-1": {ID: "kb-1", Documents: []model.Document{{
+				ID: "doc-1", KnowledgeBaseID: "kb-1", Status: "indexed",
+			}}},
+		}},
 	}
 	candidates, err := service.collectCandidates(
 		t.Context(),
@@ -799,7 +936,11 @@ func TestCollectCandidatesPropagatesContextCancellation(t *testing.T) {
 
 	service := &AppService{
 		qdrant: NewQdrantService(model.ServerConfig{QdrantURL: server.URL, QdrantVectorSize: 2}),
-		state:  &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{}},
+		state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+			"kb-1": {ID: "kb-1", Documents: []model.Document{{
+				ID: "doc-1", KnowledgeBaseID: "kb-1", Status: "indexed",
+			}}},
+		}},
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -925,6 +1066,60 @@ func TestFilterRetrievedChunksToScopeDropsForeignAndOrphanDocuments(t *testing.T
 	)
 	if len(filtered) != 1 || filtered[0].ID != "school" {
 		t.Fatalf("expected only the authoritative in-scope document, got %#v", filtered)
+	}
+}
+
+func TestFilterRetrievedChunksToScopeDropsStaleIndexGeneration(t *testing.T) {
+	service := &AppService{state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-school": {
+			ID: "kb-school",
+			Documents: []model.Document{{
+				ID:         "doc-school",
+				IndexFence: "mcp:job-current:2",
+			}},
+		},
+	}}}
+	chunks := []RetrievedChunk{
+		{DocumentChunk: DocumentChunk{ID: "current", KnowledgeBaseID: "kb-school", DocumentID: "doc-school", IndexFence: "mcp:job-current:2"}},
+		{DocumentChunk: DocumentChunk{ID: "stale", KnowledgeBaseID: "kb-school", DocumentID: "doc-school", IndexFence: "mcp:job-old:1"}},
+		{DocumentChunk: DocumentChunk{ID: "legacy", KnowledgeBaseID: "kb-school", DocumentID: "doc-school"}},
+	}
+	filtered := service.filterRetrievedChunksToScope(
+		model.ChatCompletionRequest{KnowledgeBaseID: "kb-school"},
+		[]string{"kb-school"},
+		chunks,
+	)
+	if len(filtered) != 1 || filtered[0].ID != "current" {
+		t.Fatalf("expected only current index generation, got %#v", filtered)
+	}
+}
+
+func TestFilterRetrievedChunksToScopeDropsUnavailableDocuments(t *testing.T) {
+	service := &AppService{state: &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-school": {
+			ID: "kb-school",
+			Documents: []model.Document{
+				{ID: "doc-ready", KnowledgeBaseID: "kb-school", Status: "indexed"},
+				{ID: "doc-processing", KnowledgeBaseID: "kb-school", Status: "processing"},
+				{ID: "doc-failed", KnowledgeBaseID: "kb-school", Status: "failed"},
+				{ID: "doc-deleting", KnowledgeBaseID: "kb-school", Status: "indexed", DeletionPending: true},
+			},
+		},
+	}}}
+	chunks := []RetrievedChunk{
+		{DocumentChunk: DocumentChunk{ID: "ready", KnowledgeBaseID: "kb-school", DocumentID: "doc-ready"}},
+		{DocumentChunk: DocumentChunk{ID: "processing", KnowledgeBaseID: "kb-school", DocumentID: "doc-processing"}},
+		{DocumentChunk: DocumentChunk{ID: "failed", KnowledgeBaseID: "kb-school", DocumentID: "doc-failed"}},
+		{DocumentChunk: DocumentChunk{ID: "deleting", KnowledgeBaseID: "kb-school", DocumentID: "doc-deleting"}},
+	}
+
+	filtered := service.filterRetrievedChunksToScope(
+		model.ChatCompletionRequest{KnowledgeBaseID: "kb-school"},
+		[]string{"kb-school"},
+		chunks,
+	)
+	if len(filtered) != 1 || filtered[0].DocumentID != "doc-ready" {
+		t.Fatalf("expected only ready document to remain retrievable, got %#v", filtered)
 	}
 }
 
@@ -1083,6 +1278,227 @@ func TestGetKnowledgeBaseHealthReportsStructuredMetrics(t *testing.T) {
 	}
 	if len(health.Documents) != 1 || health.Documents[0].NeedsReindex {
 		t.Fatalf("unexpected document health: %#v", health.Documents)
+	}
+}
+
+func TestGetKnowledgeBaseHealthReportsActualQdrantPointCounts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "source.txt")
+	if err := os.WriteFile(path, []byte("这是当前索引代际的文档内容。"), 0o644); err != nil {
+		t.Fatalf("write document fixture: %v", err)
+	}
+
+	var countFilter map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/collections/kb_kb-health":
+			_, _ = w.Write([]byte(`{"result":{"status":"green","points_count":1,"config":{"params":{"vectors":{"dense":{"size":768,"distance":"Cosine"}},"sparse_vectors":{}}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/collections/kb_kb-health/points/count":
+			var request qdrantCountRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode count request: %v", err)
+			}
+			countFilter = request.Filter
+			_, _ = w.Write([]byte(`{"result":{"count":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	config := model.ServerConfig{
+		QdrantURL:              server.URL,
+		QdrantCollectionPrefix: "kb_",
+		QdrantVectorSize:       768,
+		QdrantTimeoutSeconds:   1,
+	}
+	service := NewAppService(
+		NewQdrantService(config),
+		&AppStateStore{path: ""},
+		nil,
+		config,
+	)
+	service.state = &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-health": {
+			ID:   "kb-health",
+			Name: "准确性测试知识库",
+			Documents: []model.Document{{
+				ID:              "doc-health",
+				KnowledgeBaseID: "kb-health",
+				Name:            "source.txt",
+				Path:            path,
+				Status:          "indexed",
+				IndexedAt:       time.Now().UTC().Format(time.RFC3339),
+				IndexVersion:    currentIndexVersion,
+				IndexFence:      "index:current",
+			}},
+		},
+	}}
+
+	health, err := service.GetKnowledgeBaseHealth("kb-health")
+	if err != nil {
+		t.Fatalf("get knowledge base health: %v", err)
+	}
+	if health.Metrics.VectorCount != 1 || health.Metrics.VectorCountStatus != "ok" || health.Metrics.VectorCountSource != "actual" {
+		t.Fatalf("expected actual vector count, got metrics=%+v", health.Metrics)
+	}
+	if health.Metrics.QdrantStatus != "ok" || health.Metrics.QdrantVectorSize != 768 || !health.Metrics.QdrantCollectionExists {
+		t.Fatalf("unexpected qdrant metadata: %+v", health.Metrics)
+	}
+	if len(health.Documents) != 1 || health.Documents[0].VectorCount != 1 || health.Documents[0].VectorCountSource != "actual" || health.Documents[0].NeedsReindex {
+		t.Fatalf("unexpected document vector health: %+v", health.Documents)
+	}
+	encodedFilter, err := json.Marshal(countFilter)
+	if err != nil || !strings.Contains(string(encodedFilter), "index:current") {
+		t.Fatalf("expected count filter to use current index fence, got %s (err=%v)", encodedFilter, err)
+	}
+}
+
+func TestGetKnowledgeBaseHealthFlagsActualVectorChunkMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "source.txt")
+	if err := os.WriteFile(path, []byte("当前索引应该包含一个文档片段。"), 0o644); err != nil {
+		t.Fatalf("write document fixture: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"result":{"status":"green","points_count":0,"config":{"params":{"vectors":{"dense":{"size":768,"distance":"Cosine"}}}}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"count":0}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	config := model.ServerConfig{QdrantURL: server.URL, QdrantVectorSize: 768, QdrantTimeoutSeconds: 1}
+	appService := NewAppService(NewQdrantService(config), nil, nil, config)
+	appService.state = &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+		"kb-health": {
+			ID: "kb-health",
+			Documents: []model.Document{{
+				ID: "doc-health", KnowledgeBaseID: "kb-health", Name: "source.txt", Path: path,
+				Status: "indexed", IndexedAt: time.Now().UTC().Format(time.RFC3339), IndexVersion: currentIndexVersion,
+			}},
+		},
+	}}
+
+	health, err := appService.GetKnowledgeBaseHealth("kb-health")
+	if err != nil {
+		t.Fatalf("get knowledge base health: %v", err)
+	}
+	if health.Metrics.VectorCountStatus != "ok" || health.Metrics.VectorCountSource != "actual" || health.Metrics.VectorCount != 0 {
+		t.Fatalf("expected confirmed zero vector count, got metrics=%+v", health.Metrics)
+	}
+	if len(health.Documents) != 1 || !health.Documents[0].NeedsReindex || !strings.Contains(health.Documents[0].Recommendation, "不一致") {
+		t.Fatalf("expected actual vector/chunk mismatch recommendation, got documents=%+v", health.Documents)
+	}
+}
+
+func TestGetKnowledgeBaseHealthDoesNotTreatQdrantFailuresAsZeroVectors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "source.txt")
+	if err := os.WriteFile(path, []byte("这是需要校验的文档内容。"), 0o644); err != nil {
+		t.Fatalf("write document fixture: %v", err)
+	}
+
+	tests := []struct {
+		name            string
+		status          int
+		collectionBody  string
+		countBody       string
+		expectQdrant    string
+		expectVector    string
+		expectSource    string
+		expectErrorCode string
+	}{
+		{
+			name:            "collection missing",
+			status:          http.StatusNotFound,
+			expectQdrant:    "collection_missing",
+			expectVector:    "collection_missing",
+			expectSource:    "unknown",
+			expectErrorCode: "qdrant_collection_missing",
+		},
+		{
+			name:            "authentication failure",
+			status:          http.StatusUnauthorized,
+			expectQdrant:    "error",
+			expectVector:    "error",
+			expectSource:    "unknown",
+			expectErrorCode: "qdrant_unauthorized",
+		},
+		{
+			name:            "dimension mismatch",
+			status:          http.StatusOK,
+			collectionBody:  `{"result":{"status":"green","points_count":1,"config":{"params":{"vectors":{"dense":{"size":1024,"distance":"Cosine"}}}}}}`,
+			expectQdrant:    "dimension_mismatch",
+			expectVector:    "dimension_mismatch",
+			expectSource:    "unknown",
+			expectErrorCode: "qdrant_vector_dimension_mismatch",
+		},
+		{
+			name:            "count failure",
+			status:          http.StatusOK,
+			collectionBody:  `{"result":{"status":"green","points_count":1,"config":{"params":{"vectors":{"dense":{"size":768,"distance":"Cosine"}}}}}}`,
+			countBody:       `{"error":"count unavailable"}`,
+			expectQdrant:    "ok",
+			expectVector:    "error",
+			expectSource:    "unknown",
+			expectErrorCode: "qdrant_count_failed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					if test.status != http.StatusOK {
+						w.WriteHeader(test.status)
+						_, _ = w.Write([]byte(`{"status":"failure"}`))
+						return
+					}
+					_, _ = w.Write([]byte(test.collectionBody))
+					return
+				}
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/points/count") {
+					w.WriteHeader(http.StatusInternalServerError)
+					if test.countBody != "" {
+						_, _ = w.Write([]byte(test.countBody))
+					}
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+
+			config := model.ServerConfig{QdrantURL: server.URL, QdrantVectorSize: 768, QdrantTimeoutSeconds: 1}
+			appService := NewAppService(NewQdrantService(config), nil, nil, config)
+			appService.state = &model.AppState{KnowledgeBases: map[string]model.KnowledgeBase{
+				"kb-health": {
+					ID: "kb-health",
+					Documents: []model.Document{{
+						ID: "doc-health", KnowledgeBaseID: "kb-health", Name: "source.txt", Path: path,
+						Status: "indexed", IndexedAt: time.Now().UTC().Format(time.RFC3339), IndexVersion: currentIndexVersion,
+					}},
+				},
+			}}
+
+			health, err := appService.GetKnowledgeBaseHealth("kb-health")
+			if err != nil {
+				t.Fatalf("get knowledge base health: %v", err)
+			}
+			if health.Metrics.QdrantStatus != test.expectQdrant || health.Metrics.VectorCountStatus != test.expectVector || health.Metrics.VectorCountSource != test.expectSource {
+				t.Fatalf("unexpected health state: metrics=%+v", health.Metrics)
+			}
+			if health.Metrics.VectorCount != 0 || health.Status != "attention" {
+				t.Fatalf("expected unknown/error vector state without a fabricated count, got metrics=%+v status=%s", health.Metrics, health.Status)
+			}
+			if test.expectErrorCode != "" && health.Metrics.VectorCountErrorCode != test.expectErrorCode {
+				t.Fatalf("expected error code %q, got %q", test.expectErrorCode, health.Metrics.VectorCountErrorCode)
+			}
+		})
 	}
 }
 

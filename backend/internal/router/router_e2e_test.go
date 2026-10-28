@@ -629,6 +629,9 @@ func TestMCPToolsListAndCreateKnowledgeBase(t *testing.T) {
 	if !containsString(toolNames, "list_recent_jobs") {
 		t.Fatalf("expected list_recent_jobs in tools list, got %v", toolNames)
 	}
+	if !containsString(toolNames, "retry_job") {
+		t.Fatalf("expected retry_job in tools list, got %v", toolNames)
+	}
 
 	capabilitiesResp := performRequestWithHeaders(
 		t,
@@ -650,7 +653,7 @@ func TestMCPToolsListAndCreateKnowledgeBase(t *testing.T) {
 	if capabilitiesResp.Code != http.StatusOK {
 		t.Fatalf("expected capabilities status 200, got %d, body=%s", capabilitiesResp.Code, capabilitiesResp.Body.String())
 	}
-	if !strings.Contains(capabilitiesResp.Body.String(), `"toolCount":30`) ||
+	if !strings.Contains(capabilitiesResp.Body.String(), `"toolCount":31`) ||
 		!strings.Contains(capabilitiesResp.Body.String(), fmt.Sprintf(`"version":"%s"`, version.Value)) ||
 		!strings.Contains(capabilitiesResp.Body.String(), `"permissionCounts"`) ||
 		!strings.Contains(capabilitiesResp.Body.String(), `"resultContractVersion":"1.0"`) {
@@ -1210,6 +1213,15 @@ func TestMCPJobWorkflow(t *testing.T) {
 	if failedJob.Error == "" {
 		t.Fatalf("expected failed job error, got %+v", failedJob)
 	}
+	retryResp := performMCPToolCall(t, engine, headers, 506, "retry_job", map[string]any{"jobId": failedJob.ID})
+	if retryResp.Code != http.StatusOK {
+		t.Fatalf("expected retry job status 200, got %d, body=%s", retryResp.Code, retryResp.Body.String())
+	}
+	retriedJob := decodeMCPJobFromResponse(t, retryResp)
+	retriedJob = waitForMCPJobStatus(t, engine, headers, retriedJob.ID, "failed")
+	if retriedJob.ParentJobID != failedJob.ID || retriedJob.RetryCount != 1 || !retriedJob.Retryable {
+		t.Fatalf("expected failed retry child metadata, got %+v", retriedJob)
+	}
 
 	cancelStartResp := performMCPToolCall(t, engine, headers, 503, "start_import_job", map[string]any{
 		"knowledgeBaseId": knowledgeBaseID,
@@ -1450,6 +1462,45 @@ func TestDirectConversationStillCallsConfiguredModel(t *testing.T) {
 	}
 	if _, exists := chatResult.Metadata["fallbackStrategy"]; exists {
 		t.Fatalf("direct conversation must not claim a fallback strategy: %#v", chatResult.Metadata)
+	}
+}
+
+func TestChatCompletionsSendsEmptyEvidenceBoundaryToModel(t *testing.T) {
+	var receivedChatRequest []byte
+	modelHandler := func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path == "/chat/completions" || r.URL.Path == "/api/chat" {
+			receivedChatRequest = append([]byte(nil), body...)
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		handleModelAPI(w, r)
+	}
+
+	engine, _, cleanup := newTestRouterWithModelHandler(t, nil, modelHandler)
+	defer cleanup()
+
+	resp := performJSONRequest(t, engine, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"conversationId": "conv-empty-evidence-1",
+		"model":          "chat-test-model",
+		"knowledgeScope": "all",
+		"messages": []map[string]string{{
+			"role":    "user",
+			"content": "请回答一个当前知识库没有资料的问题",
+		}},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	requestText := string(receivedChatRequest)
+	for _, required := range []string{
+		"当前请求处于知识库问答模式",
+		"本次检索没有返回任何可用的文档片段",
+		"不得使用常识、预训练知识或推测补充答案",
+	} {
+		if !strings.Contains(requestText, required) {
+			t.Fatalf("expected model request to include empty evidence boundary %q, got %s", required, requestText)
+		}
 	}
 }
 
@@ -2064,6 +2115,195 @@ Redis 支持过期时间设置，适合用作会话缓存或临时数据存储�
 	}
 	if strings.TrimSpace(fmt.Sprint(firstSource["snippet"])) == "" {
 		t.Fatalf("expected snippet in source metadata, got %#v", firstSource)
+	}
+}
+
+func TestChatCompletionsNormalizesKnowledgeScopeIdentifiers(t *testing.T) {
+	engine, modelBaseURL, cleanup := newTestRouter(t)
+	defer cleanup()
+
+	listResp := performRequest(t, engine, http.MethodGet, "/api/knowledge-bases", nil, "")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list knowledge bases: status=%d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var kbList struct {
+		Items []model.KnowledgeBase `json:"items"`
+	}
+	decodeJSONResponse(t, listResp.Body.Bytes(), &kbList)
+	if len(kbList.Items) == 0 {
+		t.Fatal("expected default knowledge base")
+	}
+	knowledgeBaseID := kbList.Items[0].ID
+
+	uploadResp := performMultipartUpload(
+		t,
+		engine,
+		http.MethodPost,
+		fmt.Sprintf("/api/knowledge-bases/%s/documents", knowledgeBaseID),
+		"scope-normalization.md",
+		"# 范围规范化\n\nRedis 支持高性能缓存和持久化。",
+	)
+	if uploadResp.Code != http.StatusOK {
+		t.Fatalf("upload document: status=%d body=%s", uploadResp.Code, uploadResp.Body.String())
+	}
+	var uploadResult model.UploadResponse
+	decodeJSONResponse(t, uploadResp.Body.Bytes(), &uploadResult)
+
+	resp := performJSONRequest(t, engine, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"conversationId":  " conv-scope-normalization ",
+		"knowledgeBaseId": " " + knowledgeBaseID + " ",
+		"documentId":      " " + uploadResult.Uploaded.ID + " ",
+		"knowledgeScope":  " selected ",
+		"config": map[string]any{
+			"provider": "ollama",
+			"baseUrl":  modelBaseURL,
+			"model":    "chat-test-model",
+		},
+		"messages": []map[string]string{{
+			"role":    "user",
+			"content": "请说明 Redis 的核心特点",
+		}},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	var chatResult model.ChatCompletionResponse
+	decodeJSONResponse(t, resp.Body.Bytes(), &chatResult)
+	if got := chatResult.Metadata["knowledgeBaseId"]; got != knowledgeBaseID {
+		t.Fatalf("expected normalized knowledge base id %q, got %#v", knowledgeBaseID, got)
+	}
+	if got := chatResult.Metadata["documentId"]; got != uploadResult.Uploaded.ID {
+		t.Fatalf("expected normalized document id %q, got %#v", uploadResult.Uploaded.ID, got)
+	}
+}
+
+func TestChatCompletionsStreamNormalizesKnowledgeScopeIdentifiers(t *testing.T) {
+	modelHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/chat" {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = io.WriteString(w, `{"model":"chat-test-model","message":{"role":"assistant","content":"Redis 是高性能内存数据库"},"done":false}`+"\n")
+			_, _ = io.WriteString(w, `{"model":"chat-test-model","message":{"role":"assistant","content":"。"},"done":true}`+"\n")
+			return
+		}
+		handleModelAPI(w, r)
+	}
+
+	engine, modelBaseURL, cleanup := newTestRouterWithModelHandler(t, nil, modelHandler)
+	defer cleanup()
+
+	listResp := performRequest(t, engine, http.MethodGet, "/api/knowledge-bases", nil, "")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list knowledge bases: status=%d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var kbList struct {
+		Items []model.KnowledgeBase `json:"items"`
+	}
+	decodeJSONResponse(t, listResp.Body.Bytes(), &kbList)
+	if len(kbList.Items) == 0 {
+		t.Fatal("expected default knowledge base")
+	}
+	knowledgeBaseID := kbList.Items[0].ID
+
+	resp := performJSONRequest(t, engine, http.MethodPost, "/v1/chat/completions/stream", map[string]any{
+		"conversationId":  " conv-stream-scope-normalization ",
+		"knowledgeBaseId": " " + knowledgeBaseID + " ",
+		"knowledgeScope":  " selected ",
+		"config": map[string]any{
+			"provider": "ollama",
+			"baseUrl":  modelBaseURL,
+			"model":    "chat-test-model",
+		},
+		"messages": []map[string]string{{
+			"role":    "user",
+			"content": "请介绍 Redis",
+		}},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected stream status 200, got %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	body := resp.Body.String()
+	for _, required := range []string{
+		"event:meta",
+		"event:done",
+		`"knowledgeBaseId":"` + knowledgeBaseID + `"`,
+		`"knowledgeScope":"selected"`,
+		"Redis 是高性能内存数据库",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("expected stream response to include %q, got %s", required, body)
+		}
+	}
+	if strings.Contains(body, `"knowledgeScope":" selected "`) || strings.Contains(body, `"knowledgeBaseId":" `+knowledgeBaseID+` "`) {
+		t.Fatalf("stream response must not retain padded knowledge scope identifiers, got %s", body)
+	}
+}
+
+func TestRegenerateMessagePreservesNormalizedKnowledgeScope(t *testing.T) {
+	engine, _, cleanup := newTestRouter(t)
+	defer cleanup()
+
+	listResp := performRequest(t, engine, http.MethodGet, "/api/knowledge-bases", nil, "")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list knowledge bases: status=%d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var kbList struct {
+		Items []model.KnowledgeBase `json:"items"`
+	}
+	decodeJSONResponse(t, listResp.Body.Bytes(), &kbList)
+	if len(kbList.Items) == 0 {
+		t.Fatal("expected default knowledge base")
+	}
+	knowledgeBaseID := kbList.Items[0].ID
+	conversationID := "conv-regenerate-scope-normalization"
+	assistantMessageID := "assistant-message-to-regenerate"
+
+	saveResp := performJSONRequest(t, engine, http.MethodPut, "/api/conversations/"+conversationID, map[string]any{
+		"knowledgeBaseId": " " + knowledgeBaseID + " ",
+		"knowledgeScope":  " selected ",
+		"messages": []model.StoredChatMessage{
+			{ID: "user-message", Role: "user", Content: "请介绍 Redis"},
+			{ID: assistantMessageID, Role: "assistant", Content: "旧回答"},
+		},
+	})
+	if saveResp.Code != http.StatusOK {
+		t.Fatalf("save conversation: status=%d body=%s", saveResp.Code, saveResp.Body.String())
+	}
+
+	var savedConversation model.Conversation
+	decodeJSONResponse(t, saveResp.Body.Bytes(), &savedConversation)
+	if savedConversation.KnowledgeBaseID != knowledgeBaseID || savedConversation.KnowledgeScope != service.KnowledgeScopeSelected {
+		t.Fatalf("expected saved conversation scope to be normalized, got %+v", savedConversation)
+	}
+
+	regenResp := performJSONRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/conversations/"+conversationID+"/messages/"+assistantMessageID+"/regenerate",
+		nil,
+	)
+	if regenResp.Code != http.StatusOK {
+		t.Fatalf("regenerate conversation: status=%d body=%s", regenResp.Code, regenResp.Body.String())
+	}
+
+	var regenerateResult struct {
+		Conversation model.Conversation           `json:"conversation"`
+		Response     model.ChatCompletionResponse `json:"response"`
+	}
+	decodeJSONResponse(t, regenResp.Body.Bytes(), &regenerateResult)
+	if got := regenerateResult.Response.Metadata["knowledgeBaseId"]; got != knowledgeBaseID {
+		t.Fatalf("expected regenerated response knowledge base id %q, got %#v", knowledgeBaseID, got)
+	}
+	if got := regenerateResult.Response.Metadata["knowledgeScope"]; got != service.KnowledgeScopeSelected {
+		t.Fatalf("expected regenerated response knowledge scope %q, got %#v", service.KnowledgeScopeSelected, got)
+	}
+	if regenerateResult.Conversation.KnowledgeBaseID != knowledgeBaseID || regenerateResult.Conversation.KnowledgeScope != service.KnowledgeScopeSelected {
+		t.Fatalf("expected regenerated conversation scope to remain normalized, got %+v", regenerateResult.Conversation)
+	}
+	if len(regenerateResult.Response.Choices) == 0 || !strings.Contains(regenerateResult.Response.Choices[0].Message.Content, "Redis") {
+		t.Fatalf("expected regenerated model response, got %+v", regenerateResult.Response.Choices)
 	}
 }
 

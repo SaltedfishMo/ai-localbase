@@ -7,6 +7,7 @@ type ServerConfig struct {
 	UploadDir                      string
 	IndexedContentDir              string
 	StagingDir                     string
+	MCPJobStoreFile                string
 	MaxUploadBytes                 int64
 	MaxJSONBodyBytes               int64
 	StateFile                      string
@@ -28,6 +29,13 @@ type ServerConfig struct {
 	MCPBasePath                    string
 	MCPRequestTimeoutSeconds       int
 	MCPRequestsPerMinute           int
+	APIRequestsPerMinute           int
+	APIMaxConcurrentRequests       int
+	ChatMaxConcurrentRequests      int
+	IndexMaxConcurrentRequests     int
+	EvalMaxConcurrentRequests      int
+	UploadMaxConcurrentRequests    int
+	ModelTestMaxConcurrentRequests int
 	RetrievalTopKDocument          int
 	RetrievalCandidateTopKDocument int
 	RetrievalTopKKnowledgeBase     int
@@ -46,12 +54,31 @@ type ServerConfig struct {
 }
 
 type AppState struct {
-	Mu             sync.RWMutex
-	Config         AppConfig
-	KnowledgeBases map[string]KnowledgeBase
-	EvalDatasets   map[string]EvalDataset
-	EvalRuns       map[string]RunEvalDatasetResponse
-	Auth           AuthState
+	Mu                sync.RWMutex
+	Config            AppConfig
+	KnowledgeBases    map[string]KnowledgeBase
+	EvalDatasets      map[string]EvalDataset
+	EvalRuns          map[string]RunEvalDatasetResponse
+	IndexCleanupTasks []IndexCleanupTask
+	Auth              AuthState
+}
+
+// IndexCleanupTask is an internal, durable outbox entry for external index
+// data. It is never returned by an API response.
+type IndexCleanupTask struct {
+	ID              string   `json:"id"`
+	Type            string   `json:"type"`
+	KnowledgeBaseID string   `json:"knowledgeBaseId"`
+	DocumentID      string   `json:"documentId,omitempty"`
+	IndexFence      string   `json:"indexFence,omitempty"`
+	DocumentIDs     []string `json:"documentIds,omitempty"`
+	PointIDs        []any    `json:"pointIds,omitempty"`
+	SourcePaths     []string `json:"sourcePaths,omitempty"`
+	Attempts        int      `json:"attempts"`
+	CreatedAt       string   `json:"createdAt"`
+	UpdatedAt       string   `json:"updatedAt"`
+	NextAttemptAt   string   `json:"nextAttemptAt,omitempty"`
+	LastError       string   `json:"lastError,omitempty"`
 }
 
 type AuthState struct {
@@ -158,30 +185,43 @@ type MCPDangerConfirmationResponse struct {
 }
 
 type MCPStartImportJobRequest struct {
-	KnowledgeBaseID string   `json:"knowledgeBaseId"`
-	FileName        string   `json:"fileName"`
-	Content         string   `json:"content,omitempty"`
-	JobType         string   `json:"jobType,omitempty"`
-	DocumentID      string   `json:"documentId,omitempty"`
-	MaxPerDocument  int      `json:"maxPerDocument,omitempty"`
-	UploadIDs       []string `json:"uploadIds,omitempty"`
-	Concurrency     int      `json:"concurrency,omitempty"`
+	KnowledgeBaseID string `json:"knowledgeBaseId"`
+	FileName        string `json:"fileName"`
+	Content         string `json:"content,omitempty"`
+	UploadID        string `json:"uploadId,omitempty"`
+	// ExpectedChecksum is an internal retry guard and is never accepted from
+	// or returned to external JSON callers.
+	ExpectedChecksum string   `json:"-"`
+	JobType          string   `json:"jobType,omitempty"`
+	DocumentID       string   `json:"documentId,omitempty"`
+	MaxPerDocument   int      `json:"maxPerDocument,omitempty"`
+	UploadIDs        []string `json:"uploadIds,omitempty"`
+	Concurrency      int      `json:"concurrency,omitempty"`
 }
 
 type MCPJob struct {
-	ID            string         `json:"jobId"`
-	Type          string         `json:"type"`
-	Status        string         `json:"status"`
-	Progress      int            `json:"progress"`
-	Summary       string         `json:"summary"`
-	Result        map[string]any `json:"result,omitempty"`
-	Error         string         `json:"error,omitempty"`
-	Warnings      []string       `json:"warnings,omitempty"`
-	CreatedAt     string         `json:"createdAt"`
-	UpdatedAt     string         `json:"updatedAt"`
-	CompletedAt   string         `json:"completedAt,omitempty"`
-	OwnerUserID   string         `json:"-"`
-	OwnerAPIKeyID string         `json:"-"`
+	ID              string         `json:"jobId"`
+	Type            string         `json:"type"`
+	Status          string         `json:"status"`
+	Progress        int            `json:"progress"`
+	Summary         string         `json:"summary"`
+	Result          map[string]any `json:"result,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	Retryable       bool           `json:"retryable"`
+	RetryCount      int            `json:"retryCount"`
+	ParentJobID     string         `json:"parentJobId,omitempty"`
+	ErrorCode       string         `json:"errorCode,omitempty"`
+	Resumable       bool           `json:"resumable"`
+	RecoveryState   string         `json:"recoveryState,omitempty"`
+	Attempt         int            `json:"attempt"`
+	LastHeartbeatAt string         `json:"lastHeartbeatAt,omitempty"`
+	NextAction      string         `json:"nextAction,omitempty"`
+	CreatedAt       string         `json:"createdAt"`
+	UpdatedAt       string         `json:"updatedAt"`
+	CompletedAt     string         `json:"completedAt,omitempty"`
+	OwnerUserID     string         `json:"-"`
+	OwnerAPIKeyID   string         `json:"-"`
 }
 
 type RetrievalConfig struct {
@@ -258,9 +298,16 @@ type Document struct {
 	IndexErrorCode          string `json:"indexErrorCode,omitempty"`
 	IndexRunID              string `json:"indexRunId,omitempty"`
 	IndexVersion            int    `json:"indexVersion,omitempty"`
+	DeletionPending         bool   `json:"deletionPending,omitempty"`
 	IndexedContentAvailable bool   `json:"indexedContentAvailable,omitempty"`
 	IndexedContentChars     int    `json:"indexedContentChars,omitempty"`
 	IndexedTablesCount      int    `json:"indexedTablesCount,omitempty"`
+	IndexFence              string `json:"-"`
+	// IndexOperationFence identifies the generation currently being built.
+	// These fields are persisted for recovery but hidden from API callers.
+	IndexOperationFence   string `json:"-"`
+	IndexOperationOwner   string `json:"-"`
+	IndexOperationAttempt int    `json:"-"`
 }
 
 type IndexedTable struct {
@@ -286,6 +333,9 @@ type DocumentIndexDiagnostics struct {
 	RawContentChars       int    `json:"rawContentChars"`
 	ChunkCount            int    `json:"chunkCount"`
 	VectorCount           int    `json:"vectorCount"`
+	VectorCountStatus     string `json:"vectorCountStatus"`
+	VectorCountSource     string `json:"vectorCountSource"`
+	VectorCountErrorCode  string `json:"vectorCountErrorCode,omitempty"`
 	SummaryChunkCount     int    `json:"summaryChunkCount"`
 	StructuredRowCount    int    `json:"structuredRowCount"`
 	RawContentAvailable   bool   `json:"rawContentAvailable"`
@@ -327,36 +377,50 @@ type DocumentDetailResponse struct {
 }
 
 type KnowledgeBaseHealthMetrics struct {
-	DocumentCount      int    `json:"documentCount"`
-	IndexedCount       int    `json:"indexedCount"`
-	ProcessingCount    int    `json:"processingCount"`
-	FailedCount        int    `json:"failedCount"`
-	EmptyContentCount  int    `json:"emptyContentCount"`
-	ChunkCount         int    `json:"chunkCount"`
-	VectorCount        int    `json:"vectorCount"`
-	SummaryChunkCount  int    `json:"summaryChunkCount"`
-	StructuredRowCount int    `json:"structuredRowCount"`
-	RawContentChars    int    `json:"rawContentChars"`
-	QdrantEnabled      bool   `json:"qdrantEnabled"`
-	LastIndexedAt      string `json:"lastIndexedAt,omitempty"`
+	DocumentCount          int    `json:"documentCount"`
+	IndexedCount           int    `json:"indexedCount"`
+	ProcessingCount        int    `json:"processingCount"`
+	FailedCount            int    `json:"failedCount"`
+	EmptyContentCount      int    `json:"emptyContentCount"`
+	ChunkCount             int    `json:"chunkCount"`
+	VectorCount            int    `json:"vectorCount"`
+	VectorCountStatus      string `json:"vectorCountStatus"`
+	VectorCountSource      string `json:"vectorCountSource"`
+	VectorCountErrorCode   string `json:"vectorCountErrorCode,omitempty"`
+	SummaryChunkCount      int    `json:"summaryChunkCount"`
+	StructuredRowCount     int    `json:"structuredRowCount"`
+	RawContentChars        int    `json:"rawContentChars"`
+	QdrantEnabled          bool   `json:"qdrantEnabled"`
+	QdrantStatus           string `json:"qdrantStatus"`
+	QdrantCollectionStatus string `json:"qdrantCollectionStatus,omitempty"`
+	QdrantCollectionExists bool   `json:"qdrantCollectionExists"`
+	QdrantPointCount       int    `json:"qdrantPointCount"`
+	QdrantPointCountKnown  bool   `json:"qdrantPointCountKnown"`
+	ExpectedVectorSize     int    `json:"expectedVectorSize,omitempty"`
+	QdrantVectorSize       int    `json:"qdrantVectorSize,omitempty"`
+	QdrantSparseEnabled    bool   `json:"qdrantSparseEnabled"`
+	LastIndexedAt          string `json:"lastIndexedAt,omitempty"`
 }
 
 type KnowledgeBaseDocumentHealth struct {
-	DocumentID          string `json:"documentId"`
-	DocumentName        string `json:"documentName"`
-	Status              string `json:"status"`
-	IndexedAt           string `json:"indexedAt,omitempty"`
-	IndexError          string `json:"indexError,omitempty"`
-	IndexErrorCode      string `json:"indexErrorCode,omitempty"`
-	IndexVersion        int    `json:"indexVersion,omitempty"`
-	ChunkCount          int    `json:"chunkCount"`
-	VectorCount         int    `json:"vectorCount"`
-	SummaryChunkCount   int    `json:"summaryChunkCount"`
-	StructuredRowCount  int    `json:"structuredRowCount"`
-	RawContentChars     int    `json:"rawContentChars"`
-	RawContentAvailable bool   `json:"rawContentAvailable"`
-	NeedsReindex        bool   `json:"needsReindex"`
-	Recommendation      string `json:"recommendation,omitempty"`
+	DocumentID           string `json:"documentId"`
+	DocumentName         string `json:"documentName"`
+	Status               string `json:"status"`
+	IndexedAt            string `json:"indexedAt,omitempty"`
+	IndexError           string `json:"indexError,omitempty"`
+	IndexErrorCode       string `json:"indexErrorCode,omitempty"`
+	IndexVersion         int    `json:"indexVersion,omitempty"`
+	ChunkCount           int    `json:"chunkCount"`
+	VectorCount          int    `json:"vectorCount"`
+	VectorCountStatus    string `json:"vectorCountStatus"`
+	VectorCountSource    string `json:"vectorCountSource"`
+	VectorCountErrorCode string `json:"vectorCountErrorCode,omitempty"`
+	SummaryChunkCount    int    `json:"summaryChunkCount"`
+	StructuredRowCount   int    `json:"structuredRowCount"`
+	RawContentChars      int    `json:"rawContentChars"`
+	RawContentAvailable  bool   `json:"rawContentAvailable"`
+	NeedsReindex         bool   `json:"needsReindex"`
+	Recommendation       string `json:"recommendation,omitempty"`
 }
 
 type KnowledgeBaseHealthResponse struct {
@@ -384,19 +448,22 @@ type UploadResponse struct {
 }
 
 type StagedUpload struct {
-	ID            string `json:"id"`
-	FileName      string `json:"fileName"`
-	Path          string `json:"-"`
-	Size          int64  `json:"size"`
-	SizeLabel     string `json:"sizeLabel"`
-	SHA256        string `json:"sha256"`
-	CreatedAt     string `json:"createdAt"`
-	ExpiresAt     string `json:"expiresAt"`
-	Status        string `json:"status"`
-	Source        string `json:"source,omitempty"`
-	ConsumedAt    string `json:"consumedAt,omitempty"`
-	OwnerUserID   string `json:"-"`
-	OwnerAPIKeyID string `json:"-"`
+	ID                   string `json:"id"`
+	FileName             string `json:"fileName"`
+	Path                 string `json:"-"`
+	Size                 int64  `json:"size"`
+	SizeLabel            string `json:"sizeLabel"`
+	SHA256               string `json:"sha256"`
+	CreatedAt            string `json:"createdAt"`
+	ExpiresAt            string `json:"expiresAt"`
+	Status               string `json:"status"`
+	Source               string `json:"source,omitempty"`
+	ConsumedAt           string `json:"consumedAt,omitempty"`
+	OwnerUserID          string `json:"-"`
+	OwnerAPIKeyID        string `json:"-"`
+	ProcessingOwner      string `json:"-"`
+	ProcessingAttempt    int    `json:"-"`
+	ProcessingLeaseUntil string `json:"-"`
 }
 
 type StageUploadResponse struct {
@@ -433,6 +500,7 @@ type ChatCompletionRequest struct {
 	Messages                []ChatMessage        `json:"messages"`
 	KnowledgeBaseID         string               `json:"knowledgeBaseId"`
 	DocumentID              string               `json:"documentId"`
+	KnowledgeScope          string               `json:"knowledgeScope,omitempty"`
 	RetrievalMode           string               `json:"retrievalMode,omitempty"`
 	RerankStrategy          string               `json:"rerankStrategy,omitempty"`
 	EnableQueryRewrite      *bool                `json:"enableQueryRewrite,omitempty"`
@@ -477,6 +545,7 @@ type Conversation struct {
 	Title           string              `json:"title"`
 	KnowledgeBaseID string              `json:"knowledgeBaseId"`
 	DocumentID      string              `json:"documentId"`
+	KnowledgeScope  string              `json:"knowledgeScope"`
 	ScopeVersion    int                 `json:"scopeVersion"`
 	CreatedAt       string              `json:"createdAt"`
 	UpdatedAt       string              `json:"updatedAt"`
@@ -496,6 +565,7 @@ type ConversationListItem struct {
 	Title           string `json:"title"`
 	KnowledgeBaseID string `json:"knowledgeBaseId"`
 	DocumentID      string `json:"documentId"`
+	KnowledgeScope  string `json:"knowledgeScope"`
 	ScopeVersion    int    `json:"scopeVersion"`
 	CreatedAt       string `json:"createdAt"`
 	UpdatedAt       string `json:"updatedAt"`
@@ -507,6 +577,7 @@ type SaveConversationRequest struct {
 	Title           string              `json:"title"`
 	KnowledgeBaseID string              `json:"knowledgeBaseId"`
 	DocumentID      string              `json:"documentId"`
+	KnowledgeScope  string              `json:"knowledgeScope,omitempty"`
 	Messages        []StoredChatMessage `json:"messages"`
 }
 
@@ -627,45 +698,53 @@ type RunEvalDatasetRequest struct {
 }
 
 type EvalRunMetrics struct {
-	TotalCases                int     `json:"totalCases"`
-	HitCount                  int     `json:"hitCount"`
-	MissCount                 int     `json:"missCount"`
-	HitRate                   float64 `json:"hitRate"`
-	MRR                       float64 `json:"mrr"`
-	LatencyP50Ms              int64   `json:"latencyP50Ms"`
-	LatencyP95Ms              int64   `json:"latencyP95Ms"`
-	LowConfidence             int     `json:"lowConfidence"`
-	ErrorCount                int     `json:"errorCount"`
-	SkippedDisabled           int     `json:"skippedDisabled"`
-	EvidenceSupportedCount    int     `json:"evidenceSupportedCount"`
-	EvidenceSupportRate       float64 `json:"evidenceSupportRate"`
-	CitationMismatchCount     int     `json:"citationMismatchCount"`
-	DirectEvidenceHitCount    int     `json:"directEvidenceHitCount"`
-	DirectEvidenceHitRate     float64 `json:"directEvidenceHitRate"`
-	EvidenceGateDroppedCount  int     `json:"evidenceGateDroppedCount"`
-	EvidenceGateAffectedCases int     `json:"evidenceGateAffectedCases"`
-	EvidenceGateEmptyResults  int     `json:"evidenceGateEmptyResults"`
+	TotalCases                  int     `json:"totalCases"`
+	HitCount                    int     `json:"hitCount"`
+	MissCount                   int     `json:"missCount"`
+	HitRate                     float64 `json:"hitRate"`
+	MRR                         float64 `json:"mrr"`
+	LatencyP50Ms                int64   `json:"latencyP50Ms"`
+	LatencyP95Ms                int64   `json:"latencyP95Ms"`
+	LowConfidence               int     `json:"lowConfidence"`
+	ErrorCount                  int     `json:"errorCount"`
+	SkippedDisabled             int     `json:"skippedDisabled"`
+	EvidenceSupportedCount      int     `json:"evidenceSupportedCount"`
+	EvidenceSupportRate         float64 `json:"evidenceSupportRate"`
+	CitationMismatchCount       int     `json:"citationMismatchCount"`
+	DirectEvidenceHitCount      int     `json:"directEvidenceHitCount"`
+	DirectEvidenceHitRate       float64 `json:"directEvidenceHitRate"`
+	EvidenceGateDroppedCount    int     `json:"evidenceGateDroppedCount"`
+	EvidenceGateAffectedCases   int     `json:"evidenceGateAffectedCases"`
+	EvidenceGateEmptyResults    int     `json:"evidenceGateEmptyResults"`
+	CitationPrecision           float64 `json:"citationPrecision"`
+	EvidenceCoverage            float64 `json:"evidenceCoverage"`
+	IrrelevantEvidenceRate      float64 `json:"irrelevantEvidenceRate"`
+	CitationLocationMissingRate float64 `json:"citationLocationMissingRate"`
 }
 
 type EvalRunCaseResult struct {
-	CaseID                   string                   `json:"caseId"`
-	Question                 string                   `json:"question"`
-	ExpectedAnswer           string                   `json:"expectedAnswer"`
-	Hit                      bool                     `json:"hit"`
-	HitRank                  int                      `json:"hitRank"`
-	ReciprocalRank           float64                  `json:"reciprocalRank"`
-	MatchedBy                string                   `json:"matchedBy,omitempty"`
-	ElapsedMs                int64                    `json:"elapsedMs"`
-	LowConfidence            bool                     `json:"lowConfidence"`
-	Confidence               RetrievalDebugConfidence `json:"confidence,omitempty"`
-	EvidenceSupport          bool                     `json:"evidenceSupport"`
-	EvidenceIssue            string                   `json:"evidenceIssue,omitempty"`
-	DirectEvidence           bool                     `json:"directEvidence"`
-	EvidenceGateInputCount   int                      `json:"evidenceGateInputCount"`
-	EvidenceGateOutputCount  int                      `json:"evidenceGateOutputCount"`
-	EvidenceGateDroppedCount int                      `json:"evidenceGateDroppedCount"`
-	Error                    string                   `json:"error,omitempty"`
-	Retrieved                []RetrievalDebugChunk    `json:"retrieved"`
+	CaseID                      string                   `json:"caseId"`
+	Question                    string                   `json:"question"`
+	ExpectedAnswer              string                   `json:"expectedAnswer"`
+	Hit                         bool                     `json:"hit"`
+	HitRank                     int                      `json:"hitRank"`
+	ReciprocalRank              float64                  `json:"reciprocalRank"`
+	MatchedBy                   string                   `json:"matchedBy,omitempty"`
+	ElapsedMs                   int64                    `json:"elapsedMs"`
+	LowConfidence               bool                     `json:"lowConfidence"`
+	Confidence                  RetrievalDebugConfidence `json:"confidence,omitempty"`
+	EvidenceSupport             bool                     `json:"evidenceSupport"`
+	EvidenceIssue               string                   `json:"evidenceIssue,omitempty"`
+	DirectEvidence              bool                     `json:"directEvidence"`
+	EvidenceGateInputCount      int                      `json:"evidenceGateInputCount"`
+	EvidenceGateOutputCount     int                      `json:"evidenceGateOutputCount"`
+	EvidenceGateDroppedCount    int                      `json:"evidenceGateDroppedCount"`
+	CitationPrecision           float64                  `json:"citationPrecision"`
+	EvidenceCoverage            float64                  `json:"evidenceCoverage"`
+	IrrelevantEvidenceRate      float64                  `json:"irrelevantEvidenceRate"`
+	CitationLocationMissingRate float64                  `json:"citationLocationMissingRate"`
+	Error                       string                   `json:"error,omitempty"`
+	Retrieved                   []RetrievalDebugChunk    `json:"retrieved"`
 }
 
 type RunEvalDatasetResponse struct {

@@ -62,9 +62,30 @@ func run() error {
 		}
 	}()
 
-	appService := service.NewAppService(qdrantService, stateStore, chatHistoryStore, serverConfig)
+	mcpJobStore, err := service.NewMCPJobStore(serverConfig.MCPJobStoreFile)
+	if err != nil {
+		return fmt.Errorf("failed to initialize MCP job store: %w", err)
+	}
+
+	appService := service.NewAppServiceWithJobStore(qdrantService, stateStore, chatHistoryStore, serverConfig, mcpJobStore)
+	defer func() {
+		// Also shut down on initialization failures. ShutdownJobs may return after
+		// its deadline while a worker is still unwinding, so wait before closing
+		// SQLite and let its final fenced write complete.
+		if shutdownErr := appService.ShutdownJobs(context.Background()); shutdownErr != nil {
+			log.Printf("failed to finish MCP job shutdown: %v", shutdownErr)
+		}
+		appService.WaitForMCPJobs()
+		if closeErr := mcpJobStore.Close(); closeErr != nil {
+			log.Printf("failed to close MCP job store: %v", closeErr)
+		}
+	}()
 	stopUploadStagingCleanup := startUploadStagingCleanup(appService)
 	defer stopUploadStagingCleanup()
+	stopIndexCleanup := startIndexCleanup(appService)
+	defer stopIndexCleanup()
+	stopMCPJobMaintenance := startMCPJobMaintenance(appService)
+	defer stopMCPJobMaintenance()
 	authService, err := service.NewAuthService(appService, serverConfig)
 	if err != nil {
 		return fmt.Errorf("failed to initialize auth service: %w", err)
@@ -125,6 +146,46 @@ func run() error {
 	return nil
 }
 
+func startIndexCleanup(appService *service.AppService) func() {
+	if appService == nil {
+		return func() {}
+	}
+	if processed, err := appService.RetryPendingIndexCleanup(); err != nil {
+		log.Printf("failed to retry index cleanup at startup: %v", err)
+	} else if processed > 0 {
+		log.Printf("completed %d pending index cleanup task(s) at startup", processed)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if processed, err := appService.RetryPendingIndexCleanup(); err != nil {
+					log.Printf("failed to retry index cleanup: %v", err)
+				} else if processed > 0 {
+					log.Printf("completed %d pending index cleanup task(s)", processed)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		<-done
+	}
+}
+
 func validateAuthConfig(serverConfig model.ServerConfig) error {
 	if !serverConfig.EnableAuth {
 		return nil
@@ -162,6 +223,46 @@ func startUploadStagingCleanup(appService *service.AppService) func() {
 			case <-ticker.C:
 				if err := appService.CleanupUploadStaging(); err != nil {
 					log.Printf("failed to clean upload staging directory: %v", err)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		<-done
+	}
+}
+
+func startMCPJobMaintenance(appService *service.AppService) func() {
+	if appService == nil {
+		return func() {}
+	}
+	if deleted, err := appService.PruneMCPJobs(); err != nil {
+		log.Printf("failed to prune MCP jobs at startup: %v", err)
+	} else if deleted > 0 {
+		log.Printf("pruned %d terminal MCP jobs at startup", deleted)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if deleted, err := appService.PruneMCPJobs(); err != nil {
+					log.Printf("failed to prune MCP jobs: %v", err)
+				} else if deleted > 0 {
+					log.Printf("pruned %d terminal MCP jobs", deleted)
 				}
 			case <-stop:
 				return

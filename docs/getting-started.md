@@ -14,6 +14,8 @@
 
 部署方式、设置页面配置与 MCP 简介已放回 [`README.md`](../README.md)，避免入口信息分散。
 
+Docker 重启、健康检查和外部依赖故障处理见 [`docker-operations.md`](docker-operations.md)。
+
 ---
 
 ## 常用命令
@@ -95,6 +97,13 @@ docker compose up --build
 | `STAGING_DIR` | `data/staging` | 上传暂存目录，生产 Docker 应位于 `/app/data` 持久化卷内 |
 | `MAX_UPLOAD_BYTES` | `26214400` | 单文件上传大小上限，默认 25 MiB |
 | `MAX_JSON_BODY_BYTES` | `4194304` | 非 multipart JSON 请求体上限，默认 4 MiB |
+| `API_REQUESTS_PER_MINUTE` | `120` | 每个高成本 HTTP 资源类别按主体/IP 计算的每分钟请求上限，各类别分别计算 |
+| `API_MAX_CONCURRENT_REQUESTS` | `16` | 高成本 HTTP 接口的全局并发上限 |
+| `CHAT_MAX_CONCURRENT_REQUESTS` | `4` | 单主体 Chat 并发上限 |
+| `INDEX_MAX_CONCURRENT_REQUESTS` | `2` | 单主体索引并发上限 |
+| `EVAL_MAX_CONCURRENT_REQUESTS` | `1` | 单主体评估并发上限 |
+| `UPLOAD_MAX_CONCURRENT_REQUESTS` | `4` | 单主体上传并发上限 |
+| `MODEL_TEST_MAX_CONCURRENT_REQUESTS` | `2` | 单主体模型测试并发上限 |
 | `NGINX_CLIENT_MAX_BODY_SIZE` | `32m` | Docker 前端代理请求体上限，应高于单文件上传上限 |
 | `TRUST_EXTERNAL_PROXY_HEADERS` | `false` | 是否信任受控外层代理传入的 `X-Forwarded-Proto` / `X-Forwarded-Host` |
 | `STATE_FILE` | `data/app-state.json` | 应用状态文件 |
@@ -147,13 +156,13 @@ AUTH_PASSWORD=your-secure-password
 生产 Compose 默认将后端端口绑定到 `127.0.0.1`，并支持通过 `AI_LOCALBASE_IMAGE_TAG` 固定前后端镜像版本。生产环境建议使用具体版本启动：
 
 ```bash
-ENABLE_AUTH=true AUTH_PASSWORD=your-secure-password AI_LOCALBASE_IMAGE_TAG=v1.4.6 \
+ENABLE_AUTH=true AUTH_PASSWORD=your-secure-password AI_LOCALBASE_IMAGE_TAG=v1.4.11 \
   docker compose -f docker-compose.prod.yml up -d
 ```
 
-生产 Compose 默认使用已发布的固定镜像 `v1.4.6`；需要升级或回滚时显式设置 `AI_LOCALBASE_IMAGE_TAG`。本地源码修改请使用开发或本地构建编排验证。应用层按单实例运行，SQLite 聊天记录、应用状态文件和内存中的 MCP Job 不支持多个后端副本共享写入，请勿扩展 `backend` 副本数。
+生产 Compose 默认使用已发布的固定镜像 `v1.4.11`；需要升级或回滚时显式设置 `AI_LOCALBASE_IMAGE_TAG`。本地源码修改请使用开发或本地构建编排验证。应用层按单实例运行，SQLite 聊天记录、应用状态文件和内存中的 MCP Job 不支持多个后端副本共享写入，请勿扩展 `backend` 副本数。
 
-首次启动时，如果设置了 `AUTH_PASSWORD`，后端会自动创建 root 用户并保存密码哈希。如果未设置 `AUTH_PASSWORD`，Web 页面会进入首次初始化向导。公网部署时建议至少设置 `AUTH_SETUP_TOKEN`，避免初始化窗口被他人抢占；如果两者都未设置，当前版本默认只允许本机回环地址完成首次初始化。
+首次启动时，如果设置了 `AUTH_PASSWORD`，后端会自动创建 root 用户并保存密码哈希；密码至少需要 8 个字符，不符合要求时后端拒绝初始化。如果未设置 `AUTH_PASSWORD`，Web 页面会进入首次初始化向导。公网部署时建议至少设置 `AUTH_SETUP_TOKEN`，避免初始化窗口被他人抢占；如果两者都未设置，当前版本默认只允许本机回环地址完成首次初始化。
 
 更多认证接口、API Key 和密码重置说明见 [`docs/AUTH.md`](./AUTH.md)。
 
@@ -166,7 +175,9 @@ ENABLE_AUTH=true AUTH_PASSWORD=your-secure-password AI_LOCALBASE_IMAGE_TAG=v1.4.
 ### 基础接口
 
 - `GET /`：服务首页
-- `GET /health`：健康检查
+- `GET /health`：最小健康探针，仅返回服务状态
+- `GET /livez`：最小存活探针
+- `GET /readyz`：最小就绪探针，异常时通过 HTTP 状态码表示未就绪
 - `POST /upload`：通用上传入口
 
 ### 应用接口

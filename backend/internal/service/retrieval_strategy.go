@@ -247,6 +247,9 @@ func (s *AppService) collectCandidates(ctx context.Context, knowledgeBaseIDs []s
 	}
 
 	for _, knowledgeBaseID := range knowledgeBaseIDs {
+		if !s.hasRetrievableDocuments(knowledgeBaseID, firstNonEmpty(req.DocumentID, filenameDetectedDocID)) {
+			continue
+		}
 		kbStartedAt := time.Now()
 		filter := map[string]any{}
 		if strings.TrimSpace(req.DocumentID) != "" {
@@ -265,6 +268,7 @@ func (s *AppService) collectCandidates(ctx context.Context, knowledgeBaseIDs []s
 				}},
 			}
 		}
+		filter = s.withCurrentIndexFenceFilter(knowledgeBaseID, filter, firstNonEmpty(req.DocumentID, filenameDetectedDocID))
 
 		var items []SearchResult
 		if useHybrid {
@@ -323,6 +327,7 @@ func (s *AppService) collectCandidates(ctx context.Context, knowledgeBaseIDs []s
 					KnowledgeBaseID: payloadString(item.Payload, "knowledge_base_id", knowledgeBaseID),
 					DocumentID:      payloadString(item.Payload, "document_id", ""),
 					DocumentName:    payloadString(item.Payload, "document_name", "未知文档"),
+					IndexFence:      payloadString(item.Payload, "index_fence", ""),
 					Text:            text,
 					Index:           payloadInt(item.Payload, "chunk_index"),
 					Kind:            payloadString(item.Payload, "chunk_kind", "text"),
@@ -358,6 +363,171 @@ func (s *AppService) collectCandidates(ctx context.Context, knowledgeBaseIDs []s
 		"search_mode":       ternaryString(useHybrid, "hybrid", "dense"),
 	})
 	return results, nil
+}
+
+// withCurrentIndexFenceFilter keeps Qdrant from spending the candidate budget
+// on stale generations. A knowledge base may contain documents from different
+// index generations, so each document becomes a compound must/should branch.
+// Qdrant 1.13 accepts compound conditions directly; it does not accept the
+// newer-looking {"filter": {...}} wrapper as a condition.
+func (s *AppService) withCurrentIndexFenceFilter(knowledgeBaseID string, base map[string]any, targetDocumentID string) map[string]any {
+	if s == nil || s.state == nil {
+		return base
+	}
+	knowledgeBaseID = strings.TrimSpace(knowledgeBaseID)
+	targetDocumentID = strings.TrimSpace(targetDocumentID)
+	if targetDocumentID != "" {
+		fence := s.currentDocumentIndexFence(knowledgeBaseID, targetDocumentID)
+		return appendIndexFenceMust(base, fence)
+	}
+
+	s.state.Mu.RLock()
+	kb, ok := s.state.KnowledgeBases[knowledgeBaseID]
+	if ok {
+		kb.Documents = append([]model.Document(nil), kb.Documents...)
+	}
+	s.state.Mu.RUnlock()
+	if !ok || len(kb.Documents) == 0 {
+		return base
+	}
+	branches := make([]map[string]any, 0, len(kb.Documents))
+	for _, document := range kb.Documents {
+		documentID := strings.TrimSpace(document.ID)
+		if documentID == "" || !isRetrievableDocument(document) {
+			continue
+		}
+		must := []map[string]any{{
+			"key":   "document_id",
+			"match": map[string]any{"value": documentID},
+		}}
+		fence := strings.TrimSpace(document.IndexFence)
+		generationFilter := map[string]any{"must": must}
+		if fence != "" {
+			generationFilter["must"] = append(must, indexFenceMatchCondition(fence))
+		} else {
+			generationFilter["should"] = indexFenceEmptyConditions()
+		}
+		branches = append(branches, generationFilter)
+	}
+	if len(branches) == 0 {
+		return base
+	}
+	if len(base) == 0 {
+		return map[string]any{"should": branches}
+	}
+	result := cloneQdrantFilter(base)
+	must := qdrantFilterConditions(result["must"])
+	result["must"] = append(must, map[string]any{"should": branches})
+	return result
+}
+
+func (s *AppService) currentDocumentIndexFence(knowledgeBaseID, documentID string) string {
+	if s == nil || s.state == nil {
+		return ""
+	}
+	s.state.Mu.RLock()
+	defer s.state.Mu.RUnlock()
+	kb, ok := s.state.KnowledgeBases[strings.TrimSpace(knowledgeBaseID)]
+	if !ok {
+		return ""
+	}
+	for _, document := range kb.Documents {
+		if strings.TrimSpace(document.ID) == strings.TrimSpace(documentID) {
+			return strings.TrimSpace(document.IndexFence)
+		}
+	}
+	return ""
+}
+
+func appendIndexFenceMust(filter map[string]any, fence string) map[string]any {
+	result := cloneQdrantFilter(filter)
+	condition := indexFenceCondition(fence)
+	must := qdrantFilterConditions(result["must"])
+	result["must"] = append(must, condition)
+	return result
+}
+
+func indexFenceCondition(fence string) map[string]any {
+	if trimmed := strings.TrimSpace(fence); trimmed != "" {
+		return indexFenceMatchCondition(trimmed)
+	}
+	return map[string]any{"should": indexFenceEmptyConditions()}
+}
+
+func indexFenceMatchCondition(fence string) map[string]any {
+	return map[string]any{
+		"key":   "index_fence",
+		"match": map[string]any{"value": strings.TrimSpace(fence)},
+	}
+}
+
+func indexFenceEmptyConditions() []map[string]any {
+	return []map[string]any{
+		{"is_empty": map[string]any{"key": "index_fence"}},
+		indexFenceMatchCondition(""),
+	}
+}
+
+func qdrantFilterConditions(value any) []map[string]any {
+	switch typed := value.(type) {
+	case []map[string]any:
+		return append([]map[string]any(nil), typed...)
+	case []any:
+		conditions := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if condition, ok := item.(map[string]any); ok {
+				conditions = append(conditions, condition)
+			}
+		}
+		return conditions
+	default:
+		return nil
+	}
+}
+
+func cloneQdrantFilter(filter map[string]any) map[string]any {
+	if len(filter) == 0 {
+		return map[string]any{}
+	}
+	cloned := make(map[string]any, len(filter))
+	for key, value := range filter {
+		cloned[key] = cloneQdrantFilterValue(value)
+	}
+	return cloned
+}
+
+func cloneQdrantFilterValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			cloned[key] = cloneQdrantFilterValue(nested)
+		}
+		return cloned
+	case []map[string]any:
+		cloned := make([]map[string]any, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneQdrantFilterValue(item).(map[string]any)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneQdrantFilterValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (s *AppService) collectCandidatesForQueries(ctx context.Context, knowledgeBaseIDs []string, req model.ChatCompletionRequest, queryVector []float64, queries []string, candidateTopK int, useHybrid bool, originalQuery string) ([]RetrievedChunk, error) {
@@ -471,10 +641,12 @@ func extractFilenamesFromQuery(query string) []string {
 // findDocumentByFilename 根据文件名查找文档 ID
 // 支持多种匹配策略：精确匹配、部分匹配、扩展名匹配
 func (s *AppService) findDocumentByFilename(knowledgeBaseID string, filename string) string {
-	if s.state == nil || strings.TrimSpace(filename) == "" {
+	if s == nil || s.state == nil || strings.TrimSpace(filename) == "" {
 		return ""
 	}
 
+	s.state.Mu.RLock()
+	defer s.state.Mu.RUnlock()
 	kb, exists := s.state.KnowledgeBases[knowledgeBaseID]
 	if !exists {
 		return ""

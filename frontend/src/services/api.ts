@@ -4,8 +4,10 @@ import type {
   Conversation,
   DocumentItem,
   KnowledgeBase,
+  KnowledgeScope,
   MCPConfig,
 } from '../App'
+import { normalizeKnowledgeScope } from '../app/appHelpers'
 import { filterCitationMetadata } from '../components/chat/citationSources'
 
 export const API_BASE_PATH = ''
@@ -148,6 +150,7 @@ export interface HealthSummaryResponse {
   embedding_model: ComponentHealthResponse
   storage: ComponentHealthResponse
   auth: ComponentHealthResponse
+  mcp_job_store: ComponentHealthResponse
 }
 
 export interface BackendConversationListItem {
@@ -155,6 +158,7 @@ export interface BackendConversationListItem {
   title: string
   knowledgeBaseId: string
   documentId: string
+  knowledgeScope?: KnowledgeScope
   scopeVersion?: number
   createdAt: string
   updatedAt: string
@@ -170,6 +174,7 @@ export interface BackendConversation {
   title: string
   knowledgeBaseId: string
   documentId: string
+  knowledgeScope?: KnowledgeScope
   scopeVersion?: number
   createdAt: string
   updatedAt: string
@@ -197,6 +202,9 @@ export interface DocumentIndexDiagnostics {
   rawContentChars: number
   chunkCount: number
   vectorCount: number
+  vectorCountStatus: 'ok' | 'error' | 'collection_missing' | 'dimension_mismatch' | 'not_applicable' | string
+  vectorCountSource: 'actual' | 'estimated' | 'unknown' | 'not_applicable' | string
+  vectorCountErrorCode?: string
   summaryChunkCount: number
   structuredRowCount: number
   rawContentAvailable: boolean
@@ -243,10 +251,21 @@ export interface KnowledgeBaseHealthMetrics {
   emptyContentCount: number
   chunkCount: number
   vectorCount: number
+  vectorCountStatus: 'ok' | 'error' | 'collection_missing' | 'dimension_mismatch' | 'not_applicable' | string
+  vectorCountSource: 'actual' | 'estimated' | 'unknown' | 'not_applicable' | string
+  vectorCountErrorCode?: string
   summaryChunkCount: number
   structuredRowCount: number
   rawContentChars: number
   qdrantEnabled: boolean
+  qdrantStatus: 'ok' | 'error' | 'collection_missing' | 'dimension_mismatch' | 'not_applicable' | string
+  qdrantCollectionStatus?: 'present' | 'missing' | 'unavailable' | 'disabled' | string
+  qdrantCollectionExists: boolean
+  qdrantPointCount: number
+  qdrantPointCountKnown: boolean
+  expectedVectorSize?: number
+  qdrantVectorSize?: number
+  qdrantSparseEnabled: boolean
   lastIndexedAt?: string
 }
 
@@ -260,6 +279,9 @@ export interface KnowledgeBaseDocumentHealth {
   indexVersion?: number
   chunkCount: number
   vectorCount: number
+  vectorCountStatus: 'ok' | 'error' | 'collection_missing' | 'dimension_mismatch' | 'not_applicable' | string
+  vectorCountSource: 'actual' | 'estimated' | 'unknown' | 'not_applicable' | string
+  vectorCountErrorCode?: string
   summaryChunkCount: number
   structuredRowCount: number
   rawContentChars: number
@@ -518,6 +540,10 @@ export interface EvalRunMetrics {
   evidenceGateDroppedCount: number
   evidenceGateAffectedCases: number
   evidenceGateEmptyResults: number
+  citationPrecision?: number
+  evidenceCoverage?: number
+  irrelevantEvidenceRate?: number
+  citationLocationMissingRate?: number
 }
 
 export interface EvalRunCaseResult {
@@ -537,6 +563,10 @@ export interface EvalRunCaseResult {
   evidenceGateInputCount: number
   evidenceGateOutputCount: number
   evidenceGateDroppedCount: number
+  citationPrecision?: number
+  evidenceCoverage?: number
+  irrelevantEvidenceRate?: number
+  citationLocationMissingRate?: number
   error?: string
   retrieved: RetrievalDebugChunk[]
 }
@@ -626,6 +656,11 @@ export const normalizeConversation = (conversation: BackendConversation): Conver
   title: conversation.title,
   knowledgeBaseId: conversation.knowledgeBaseId ?? '',
   documentId: conversation.documentId ?? '',
+  knowledgeScope: normalizeKnowledgeScope(
+    conversation.knowledgeScope,
+    conversation.knowledgeBaseId ?? '',
+    conversation.documentId ?? '',
+  ),
   scopeVersion: conversation.scopeVersion ?? 0,
   createdAt: conversation.createdAt,
   updatedAt: conversation.updatedAt,
@@ -755,6 +790,7 @@ export const serializeConversation = (conversation: Conversation, title = conver
   title,
   knowledgeBaseId: conversation.knowledgeBaseId,
   documentId: conversation.documentId,
+  knowledgeScope: conversation.knowledgeScope,
   messages: conversation.messages.map((message) => ({
     id: message.id,
     role: message.role,
